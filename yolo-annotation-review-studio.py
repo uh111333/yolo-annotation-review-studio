@@ -9,12 +9,13 @@ from __future__ import annotations
 import os
 import sys
 import threading
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 import cv2
 import numpy as np
-from PyQt5.QtCore import QEvent, QPoint, QRectF, Qt, QThread, QSettings, pyqtSignal
+from PyQt5.QtCore import QEvent, QPoint, QRectF, Qt, QThread, QSettings, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QFont, QImage, QPainter, QPen
 from PyQt5.QtWidgets import (
     QAction,
@@ -39,6 +40,7 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSlider,
     QSpinBox,
     QTreeWidget,
@@ -338,42 +340,6 @@ def box_iou(a: dict, b: dict) -> float:
     return intersection / union if union > 0 else 0.0
 
 
-def match_detection_confidences(
-    label_boxes: list[dict],
-    detections: list[dict],
-    iou_threshold: float = 0.50,
-) -> dict[int, float]:
-    """按类别与 IoU 将模型检测分数一对一匹配到已有标注框。"""
-    threshold = min(max(float(iou_threshold), 0.0), 1.0)
-    candidates: list[tuple[float, int, int]] = []
-    for label_index, label_box in enumerate(label_boxes):
-        label_name = str(label_box.get("class_name", ""))
-        for detection_index, detection in enumerate(detections):
-            if label_name != str(detection.get("class_name", "")):
-                continue
-            overlap = box_iou(label_box, detection)
-            if overlap >= threshold:
-                candidates.append((overlap, label_index, detection_index))
-
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    matched_labels: set[int] = set()
-    matched_detections: set[int] = set()
-    matched: dict[int, float] = {}
-    for _overlap, label_index, detection_index in candidates:
-        if label_index in matched_labels or detection_index in matched_detections:
-            continue
-        try:
-            confidence = float(detections[detection_index].get("confidence", 0.0))
-        except (TypeError, ValueError, OverflowError):
-            continue
-        if not np.isfinite(confidence):
-            continue
-        matched[label_index] = min(max(confidence, 0.0), 1.0)
-        matched_labels.add(label_index)
-        matched_detections.add(detection_index)
-    return matched
-
-
 def remove_overlapping_boxes(
     existing_boxes: list[dict], new_box: dict, iou_threshold: float
 ) -> tuple[list[dict], int]:
@@ -436,6 +402,20 @@ def class_aware_nms(boxes: list[dict], iou_threshold: float, max_det: int) -> li
                 remaining.append(candidate)
         ordered = remaining
     return kept
+
+
+def filter_boxes_overlapping_reference(
+    candidate_boxes: list[dict], reference_boxes: list[dict], iou_threshold: float
+) -> list[dict]:
+    """仅保留与任意参考框达到指定 IoU 的候选框；不比较类别。"""
+    if not candidate_boxes or not reference_boxes:
+        return []
+    threshold = min(max(float(iou_threshold), 0.01), 1.0)
+    return [
+        candidate
+        for candidate in candidate_boxes
+        if any(box_iou(candidate, reference) >= threshold for reference in reference_boxes)
+    ]
 
 
 def normalize_batch_frame_range(
@@ -552,9 +532,16 @@ class PredictThread(QThread):
         imgsz_values: tuple[int, ...],
         max_det: int,
         min_box_side: int = 0,
+        secondary_model=None,
+        dual_model_mode: str = "all",
+        dual_model_overlap_iou: float = 0.30,
     ):
         super().__init__()
         self.model = model
+        self.secondary_model = secondary_model
+        self.dual_model_mode = str(dual_model_mode)
+        self.dual_model_overlap_iou = float(dual_model_overlap_iou)
+        self.secondary_warning: Optional[str] = None
         self.image = image.copy()
         self.file_path = file_path
         self.frame_index = frame_index
@@ -564,22 +551,85 @@ class PredictThread(QThread):
         self.max_det = int(max_det)
         self.min_box_side = max(0, int(min_box_side))
 
+    def _infer(self, model) -> list[dict]:
+        return infer_yolo_multiscale(
+            model,
+            self.image,
+            self.conf,
+            self.iou,
+            self.max_det,
+            self.imgsz_values,
+            self.min_box_side,
+        )
+
     def run(self) -> None:
         try:
-            boxes = infer_yolo_multiscale(
-                self.model,
-                self.image,
-                self.conf,
-                self.iou,
-                self.max_det,
-                self.imgsz_values,
-                self.min_box_side,
-            )
+            boxes = self._infer(self.model)
+            if self.secondary_model is not None:
+                # 同一工作线程内顺序调用两个模型，避免 GPU 并发推理和额外任务队列。
+                for detection in boxes:
+                    detection["model_index"] = 1
+                try:
+                    secondary_boxes = self._infer(self.secondary_model)
+                    for detection in secondary_boxes:
+                        detection["model_index"] = 2
+                    if self.dual_model_mode == "overlap":
+                        secondary_boxes = filter_boxes_overlapping_reference(
+                            secondary_boxes, boxes, self.dual_model_overlap_iou
+                        )
+                    boxes.extend(secondary_boxes)
+                except Exception as exc:
+                    # 副模型失败不影响主模型本轮结果。
+                    self.secondary_warning = f"{type(exc).__name__}: {exc}"
             self.finished_signal.emit(self.file_path, self.frame_index, boxes)
         except Exception as exc:
             self.error_signal.emit(
                 self.file_path, self.frame_index, f"{type(exc).__name__}: {exc}"
             )
+
+
+class CameraCaptureThread(QThread):
+    """独占摄像头设备并持续采集；只保留最新帧，避免 Qt 信号队列积压。"""
+
+    error_signal = pyqtSignal(str)
+
+    def __init__(self, device_index: int = 0):
+        super().__init__()
+        self.device_index = int(device_index)
+        self._stop_event = threading.Event()
+        self._lock = threading.Lock()
+        self._latest_frame: Optional[np.ndarray] = None
+        self._sequence = 0
+
+    def run(self) -> None:
+        capture = cv2.VideoCapture(self.device_index)
+        if not capture.isOpened():
+            capture.release()
+            self.error_signal.emit(
+                f"无法打开本机摄像头设备 {self.device_index}。请检查设备连接、权限或占用情况。"
+            )
+            return
+        try:
+            while not self._stop_event.is_set():
+                ok, frame = capture.read()
+                if not ok or frame is None:
+                    if not self._stop_event.is_set():
+                        self.error_signal.emit("摄像头读取失败或设备已断开。")
+                    break
+                with self._lock:
+                    self._latest_frame = frame
+                    self._sequence += 1
+        finally:
+            capture.release()
+
+    def request_stop(self) -> None:
+        self._stop_event.set()
+
+    def latest_frame(self) -> tuple[int, Optional[np.ndarray]]:
+        with self._lock:
+            if self._latest_frame is None:
+                return self._sequence, None
+            return self._sequence, self._latest_frame.copy()
 
 
 class BatchPredictThread(QThread):
@@ -802,7 +852,7 @@ class LabelChooserDialog(QDialog):
 
 
 class ModelSettingsDialog(QDialog):
-    """AI 推理参数设置。参数由主窗口持久化，并应用于后续推理任务。"""
+    """应用程序设置；参数由主窗口持久化并应用于后续任务。"""
 
     def __init__(
         self,
@@ -817,15 +867,79 @@ class ModelSettingsDialog(QDialog):
         video_available: bool,
         multiscale_enabled: bool,
         multiscale_sizes: str,
+        show_validation_imgsz: bool,
         min_box_side: int,
         manual_replace_overlap_enabled: bool,
         manual_replace_overlap_iou: float,
+        camera_device_index: int,
+        secondary_model_path: str,
+        validation_model_mode: str,
+        validation_overlap_iou: float,
         parent=None,
     ):
         super().__init__(parent)
-        self.setWindowTitle("AI 推理设置")
+        self.setWindowTitle("设置")
         self.setModal(True)
-        self.setMinimumWidth(420)
+        self.setMinimumWidth(520)
+
+        self.camera_device_combo = QComboBox()
+        for device_index in range(10):
+            label = f"摄像头 {device_index}（默认）" if device_index == 0 else f"摄像头 {device_index}"
+            self.camera_device_combo.addItem(label, device_index)
+        selected_camera_row = self.camera_device_combo.findData(int(camera_device_index))
+        self.camera_device_combo.setCurrentIndex(max(0, selected_camera_row))
+        self.camera_device_combo.setToolTip(
+            "通过 OpenCV 设备编号选择本机摄像头。0 通常是默认摄像头，其他编号对应其他设备；"
+            "点击应用后，若摄像头已打开会立即切换到新设备。"
+        )
+        camera_form = QFormLayout()
+        camera_form.addRow("摄像头设备", self.camera_device_combo)
+        self.camera_group = QGroupBox("摄像头")
+        self.camera_group.setLayout(camera_form)
+
+        self.secondary_model_edit = QLineEdit(str(secondary_model_path or ""))
+        self.secondary_model_edit.setClearButtonEnabled(True)
+        self.secondary_model_edit.setPlaceholderText("可选：选择第二个 YOLO .pt 权重文件")
+        self.secondary_model_edit.setToolTip(
+            "副模型仅参与实时验证，不影响单帧或批量 AI 预标注。清空此项即可关闭双模型验证。"
+        )
+        secondary_browse_button = QPushButton("浏览…")
+        secondary_browse_button.clicked.connect(self._browse_secondary_model)
+        secondary_path_row = QWidget()
+        secondary_path_layout = QHBoxLayout(secondary_path_row)
+        secondary_path_layout.setContentsMargins(0, 0, 0, 0)
+        secondary_path_layout.addWidget(self.secondary_model_edit, 1)
+        secondary_path_layout.addWidget(secondary_browse_button)
+
+        self.validation_model_mode_combo = QComboBox()
+        self.validation_model_mode_combo.addItem("全量", "all")
+        self.validation_model_mode_combo.addItem("叠加", "overlap")
+        mode_row = self.validation_model_mode_combo.findData(str(validation_model_mode))
+        self.validation_model_mode_combo.setCurrentIndex(max(0, mode_row))
+        self.validation_model_mode_combo.setToolTip(
+            "全量：显示两个模型的全部检测框。叠加：主模型全部显示，副模型仅显示与主模型检测框达到阈值的结果。"
+        )
+
+        self.validation_overlap_iou_spin = QDoubleSpinBox()
+        self.validation_overlap_iou_spin.setRange(0.01, 1.00)
+        self.validation_overlap_iou_spin.setDecimals(2)
+        self.validation_overlap_iou_spin.setSingleStep(0.05)
+        self.validation_overlap_iou_spin.setValue(validation_overlap_iou)
+        self.validation_overlap_iou_spin.setToolTip(
+            "副模型检测框与任意主模型检测框的几何 IoU 达到此值时才显示；不比较类别。"
+        )
+
+        dual_model_form = QFormLayout()
+        dual_model_form.addRow("副模型权重", secondary_path_row)
+        dual_model_form.addRow("显示方式", self.validation_model_mode_combo)
+        dual_model_form.addRow("重叠 IoU 阈值", self.validation_overlap_iou_spin)
+        self.dual_model_group = QGroupBox("实时验证双模型")
+        self.dual_model_group.setLayout(dual_model_form)
+        self.secondary_model_edit.textChanged.connect(self._update_dual_model_controls)
+        self.validation_model_mode_combo.currentIndexChanged.connect(
+            self._update_dual_model_controls
+        )
+        self._update_dual_model_controls()
 
         self.conf_spin = QDoubleSpinBox()
         self.conf_spin.setRange(0.01, 1.00)
@@ -864,12 +978,18 @@ class ModelSettingsDialog(QDialog):
             "用英文逗号分隔，至少填写两个不同尺寸（320–8192）。"
         )
         self.multiscale_sizes_label = QLabel("多分辨率尺寸列表")
+        self.show_validation_imgsz_check = QCheckBox("实时验证框显示对应推理分辨率")
+        self.show_validation_imgsz_check.setChecked(show_validation_imgsz)
+        self.show_validation_imgsz_check.setToolTip(
+            "仅在多分辨率融合模式下生效；在实时验证框标签中显示该检测框对应的来源分辨率数值。"
+        )
         self.multiscale_check.toggled.connect(self._update_resolution_controls)
 
         resolution_form = QFormLayout()
         resolution_form.addRow(self.imgsz_label, self.imgsz_spin)
         resolution_form.addRow(self.multiscale_check)
         resolution_form.addRow(self.multiscale_sizes_label, self.multiscale_sizes_edit)
+        resolution_form.addRow(self.show_validation_imgsz_check)
         self.resolution_group = QGroupBox("推理输入分辨率")
         self.resolution_group.setLayout(resolution_form)
         self._update_resolution_controls(multiscale_enabled)
@@ -889,7 +1009,7 @@ class ModelSettingsDialog(QDialog):
             "过滤宽或高小于此值的检测框；0 表示关闭。"
         )
 
-        self.manual_replace_overlap_check = QCheckBox("绘制新框时自动移除重叠标注框")
+        self.manual_replace_overlap_check = QCheckBox("标注智能修正功能：阈值")
         self.manual_replace_overlap_check.setChecked(manual_replace_overlap_enabled)
         self.manual_replace_overlap_iou_spin = QDoubleSpinBox()
         self.manual_replace_overlap_iou_spin.setRange(0.01, 1.00)
@@ -897,7 +1017,7 @@ class ModelSettingsDialog(QDialog):
         self.manual_replace_overlap_iou_spin.setSingleStep(0.05)
         self.manual_replace_overlap_iou_spin.setValue(manual_replace_overlap_iou)
         self.manual_replace_overlap_iou_spin.setToolTip(
-            "新框会移除 IoU 达到此阈值的现有框，不区分类别。"
+            "绘制新框时，自动移除与新框 IoU 达到此阈值的现有标注框，不区分类别。"
         )
         self.manual_replace_overlap_iou_spin.setEnabled(manual_replace_overlap_enabled)
         self.manual_replace_overlap_check.toggled.connect(
@@ -938,14 +1058,16 @@ class ModelSettingsDialog(QDialog):
 
         form = QFormLayout()
         form.addRow("置信度阈值（conf）", self.conf_spin)
-        form.addRow("NMS IoU 阈值（IoU）", self.iou_spin)
+        form.addRow("NMS IoU 阈值", self.iou_spin)
         form.addRow(self.resolution_group)
-        form.addRow("每帧最大检测数（max_det）", self.max_det_spin)
+        form.addRow("每帧最大检测数", self.max_det_spin)
         form.addRow("最小目标边长", self.min_box_side_spin)
-        form.addRow(self.manual_replace_overlap_check)
-        form.addRow("重叠判定阈值（IoU）", self.manual_replace_overlap_iou_spin)
+        form.addRow(self.manual_replace_overlap_check, self.manual_replace_overlap_iou_spin)
         form.addRow("批量视频采样间隔（帧）", self.frame_step_spin)
         form.addRow(self.batch_range_group)
+        # 摄像头和副模型属于低频使用的扩展功能，放在设置末尾。
+        form.addRow(self.camera_group)
+        form.addRow(self.dual_model_group)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.button(QDialogButtonBox.Ok).setText("应用")
@@ -953,9 +1075,33 @@ class ModelSettingsDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
 
+        form_content = QWidget()
+        form_content.setLayout(form)
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setMinimumHeight(440)
+        scroll_area.setMaximumHeight(680)
+        scroll_area.setWidget(form_content)
+
         layout = QVBoxLayout(self)
-        layout.addLayout(form)
+        layout.addWidget(scroll_area, 1)
         layout.addWidget(buttons)
+
+    def _browse_secondary_model(self) -> None:
+        current_path = self.secondary_model_edit.text().strip()
+        start_dir = str(Path(current_path).expanduser().parent) if current_path else str(SCRIPT_DIR)
+        filename, _ = QFileDialog.getOpenFileName(
+            self, "选择副模型 YOLO 权重", start_dir, "YOLO 权重 (*.pt);;所有文件 (*)"
+        )
+        if filename:
+            self.secondary_model_edit.setText(filename)
+
+    def _update_dual_model_controls(self, *_args) -> None:
+        enabled = bool(self.secondary_model_edit.text().strip())
+        self.validation_model_mode_combo.setEnabled(enabled)
+        self.validation_overlap_iou_spin.setEnabled(
+            enabled and self.validation_model_mode_combo.currentData() == "overlap"
+        )
 
     def _update_resolution_controls(self, multiscale_enabled: bool) -> None:
         """同步启用状态，避免用户误以为两种分辨率设置会同时生效。"""
@@ -964,6 +1110,7 @@ class ModelSettingsDialog(QDialog):
         self.imgsz_label.setEnabled(single_scale_enabled)
         self.multiscale_sizes_edit.setEnabled(bool(multiscale_enabled))
         self.multiscale_sizes_label.setEnabled(bool(multiscale_enabled))
+        self.show_validation_imgsz_check.setEnabled(bool(multiscale_enabled))
 
     def accept(self) -> None:
         start_frame = self.batch_start_frame_spin.value()
@@ -985,7 +1132,7 @@ class ModelSettingsDialog(QDialog):
                 return
         super().accept()
 
-    def values(self) -> tuple[float, float, int, int, int, bool, float, int, bool, str, int, int]:
+    def values(self) -> tuple:
         enabled = self.multiscale_check.isChecked()
         sizes_text = self.multiscale_sizes_edit.text().strip()
         return (
@@ -999,8 +1146,13 @@ class ModelSettingsDialog(QDialog):
             self.frame_step_spin.value(),
             enabled,
             sizes_text,
+            self.show_validation_imgsz_check.isChecked(),
             self.batch_start_frame_spin.value(),
             self.batch_end_frame_spin.value(),
+            int(self.camera_device_combo.currentData()),
+            self.secondary_model_edit.text().strip(),
+            str(self.validation_model_mode_combo.currentData()),
+            self.validation_overlap_iou_spin.value(),
         )
 
 
@@ -1021,6 +1173,7 @@ class Canvas(QWidget):
 
         self._image: Optional[QImage] = None
         self._boxes: list[dict] = []
+        self._validation_boxes: list[dict] = []
         self._selected_index = -1
         self._drag_start: Optional[QPoint] = None
         self._drag_end: Optional[QPoint] = None
@@ -1033,6 +1186,15 @@ class Canvas(QWidget):
 
     def set_validation_mode(self, enabled: bool) -> None:
         self._validation_mode = bool(enabled)
+        self._selected_index = -1
+        if enabled:
+            self._drag_start = None
+            self._drag_end = None
+        self.update()
+
+    def set_validation_boxes(self, boxes: list[dict]) -> None:
+        """设置仅用于实时验证显示的检测框，不与标注框共享数据。"""
+        self._validation_boxes = boxes
         self.update()
 
     def set_frame(self, frame_bgr: np.ndarray, reset_view: bool = False) -> None:
@@ -1043,6 +1205,10 @@ class Canvas(QWidget):
         ).copy()
         if reset_view:
             self.reset_view()
+        self.update()
+
+    def clear_frame(self) -> None:
+        self._image = None
         self.update()
 
     def set_boxes(self, boxes: list[dict]) -> None:
@@ -1105,7 +1271,8 @@ class Canvas(QWidget):
         painter.drawImage(QRectF(ox, oy, iw * scale, ih * scale), self._image)
         painter.setFont(QFont("Microsoft YaHei", 10))
 
-        for index, box in enumerate(self._boxes):
+        visible_boxes = self._validation_boxes if self._validation_mode else self._boxes
+        for index, box in enumerate(visible_boxes):
             color = BOX_COLORS[int(box["class_id"]) % len(BOX_COLORS)]
             rect = QRectF(
                 ox + float(box["x1"]) * scale,
@@ -1113,7 +1280,7 @@ class Canvas(QWidget):
                 (float(box["x2"]) - float(box["x1"])) * scale,
                 (float(box["y2"]) - float(box["y1"])) * scale,
             )
-            if index == self._selected_index:
+            if not self._validation_mode and index == self._selected_index:
                 painter.setPen(QPen(QColor(255, 255, 255), 5))
                 painter.drawRect(rect)
             painter.setPen(QPen(color, 2))
@@ -1122,11 +1289,13 @@ class Canvas(QWidget):
             text_y = rect.top() - 6 if rect.top() > 18 else rect.bottom() + 16
             label = str(box.get("class_name", box["class_id"]))
             if self._validation_mode:
-                confidence = box.get("validation_confidence")
-                if confidence is None:
-                    label += "  未匹配"
-                else:
-                    label += f"  {float(confidence):.2f}"
+                model_index = box.get("model_index")
+                if model_index in (1, 2):
+                    label = f"{model_index}-{label}"
+                label += f"  {float(box.get('confidence', 0.0)):.2f}"
+                source_imgsz = box.get("source_imgsz")
+                if source_imgsz is not None and box.get("show_source_imgsz", False):
+                    label += f"  {int(source_imgsz)}"
             painter.setPen(QPen(QColor(0, 0, 0), 3))
             painter.drawText(QPoint(int(rect.left()) + 1, int(text_y) + 1), label)
             painter.setPen(QPen(color, 1))
@@ -1179,6 +1348,8 @@ class Canvas(QWidget):
             self.setCursor(Qt.ClosedHandCursor)
             return
         if event.button() == Qt.LeftButton:
+            if self._validation_mode:
+                return
             start = self._to_image(event.pos(), clamp=False)
             # 点击图片四周的留白不应被错误映射到图像边缘。
             if start is None:
@@ -1204,6 +1375,12 @@ class Canvas(QWidget):
             self._is_panning = False
             self._last_mouse_pos = None
             self.setCursor(Qt.CrossCursor)
+            return
+
+        if event.button() == Qt.LeftButton and self._validation_mode:
+            self._drag_start = None
+            self._drag_end = None
+            self.update()
             return
 
         if event.button() == Qt.LeftButton and self._drag_start is not None:
@@ -1246,6 +1423,13 @@ class AnnotatorWindow(QMainWindow):
         self.current_file: Optional[Path] = None
         self.is_video = False
         self.cap: Optional[cv2.VideoCapture] = None
+        self.is_camera = False
+        self.camera_device_index = 0
+        self.camera_thread: Optional[CameraCaptureThread] = None
+        self.camera_last_sequence = -1
+        self.camera_timer = QTimer(self)
+        self.camera_timer.setInterval(30)
+        self.camera_timer.timeout.connect(self._update_camera_frame)
         self.total_frames = 0
         self.frame_idx = 0
         self.frame: Optional[np.ndarray] = None
@@ -1280,11 +1464,39 @@ class AnnotatorWindow(QMainWindow):
         self.model_path: Optional[Path] = None
         self.predict_thread: Optional[PredictThread] = None
         self.predicting = False
+        # 实时验证使用独立线程，不占用标注任务的 predicting 状态，也不阻塞视频播放。
+        self.validation_thread: Optional[PredictThread] = None
         self.validation_mode = False
-        self.validation_match_iou = 0.50
+        # 每次切换媒体或验证模式时递增；旧会话的推理结果不得覆盖新会话。
+        self.validation_generation = 0
+        self.validation_boxes: list[dict] = []
 
-        # 使用 QSettings 持久化推理参数；首次启动采用常用默认值。
+        self.is_playing = False
+        self.video_fps = 30.0
+        self.playback_timer = QTimer(self)
+        # 使用周期定时器按视频 FPS 推进；解码与显示开销不再额外叠加到每帧间隔。
+        self.playback_timer.setSingleShot(False)
+        self.playback_timer.timeout.connect(self._advance_playback)
+
+        # 使用 QSettings 持久化推理参数及上次加载的模型路径。
         self.app_settings = QSettings("YOLOAnnotator", "YOLOAnnotator")
+        self.camera_device_index = self._read_int_setting("camera/device_index", 0, 0, 9)
+        saved_secondary_path = str(self.app_settings.value("validation/secondary_model_path", "")).strip()
+        self.secondary_model_path: Optional[Path] = (
+            Path(saved_secondary_path).expanduser() if saved_secondary_path else None
+        )
+        self.secondary_ai_model = None
+        self.validation_model_mode = str(
+            self.app_settings.value("validation/dual_model_mode", "all")
+        )
+        if self.validation_model_mode not in {"all", "overlap"}:
+            self.validation_model_mode = "all"
+        self.validation_overlap_iou = self._read_float_setting(
+            "validation/dual_model_overlap_iou", 0.30, 0.01, 1.00
+        )
+        self.show_validation_imgsz = self.app_settings.value(
+            "inference/show_validation_imgsz", False, type=bool
+        )
         self.inference_conf = self._read_float_setting("inference/conf", 0.40, 0.01, 1.00)
         self.inference_iou = self._read_float_setting("inference/iou", 0.70, 0.01, 0.99)
         self.inference_imgsz = self._read_int_setting("inference/imgsz", 640, 320, 8192)
@@ -1316,17 +1528,50 @@ class AnnotatorWindow(QMainWindow):
         if app is not None:
             app.installEventFilter(self)
 
-        model_path = Path(AI_MODEL_PATH).expanduser()
-        if model_path.is_file():
-            self._load_model(model_path, startup=True)
-        elif not HAS_YOLO:
+        saved_model_path = str(self.app_settings.value("model/last_path", "")).strip()
+        startup_model_paths = []
+        if saved_model_path:
+            startup_model_paths.append(Path(saved_model_path).expanduser())
+        configured_model_path = Path(AI_MODEL_PATH).expanduser()
+        if configured_model_path not in startup_model_paths:
+            startup_model_paths.append(configured_model_path)
+
+        model_loaded = False
+        for candidate_path in startup_model_paths:
+            if candidate_path.is_file() and self._load_model(candidate_path, startup=True):
+                model_loaded = True
+                break
+        secondary_model_warning = None
+        if self.secondary_model_path is not None and HAS_YOLO:
+            if self.secondary_model_path.is_file():
+                try:
+                    self.secondary_ai_model = YOLO(str(self.secondary_model_path.resolve()))
+                    self.secondary_model_path = self.secondary_model_path.resolve()
+                except Exception as exc:
+                    secondary_model_warning = (
+                        f"副模型加载失败：{type(exc).__name__}: {exc}"
+                    )
+            else:
+                secondary_model_warning = (
+                    f"副模型文件不存在：{self.secondary_model_path}"
+                )
+
+        if not model_loaded and not HAS_YOLO:
             self.status_lbl.setText(
                 "就绪。未安装 ultralytics；仍可进行人工标注，但无法使用 AI 预标注。"
             )
-        else:
-            self.status_lbl.setText(
-                "就绪。请打开图像/视频目录，并加载 YOLO 权重以启用 AI 预标注。"
-            )
+        elif not model_loaded:
+            if saved_model_path and not Path(saved_model_path).expanduser().is_file():
+                self.status_lbl.setText(
+                    f"上次使用的模型文件不存在：{saved_model_path}。请重新加载模型。"
+                )
+            else:
+                self.status_lbl.setText(
+                    "就绪。可打开图像/视频目录或本机摄像头；加载 YOLO 权重后可启用 AI 功能。"
+                )
+        if secondary_model_warning:
+            self.status_lbl.setText(secondary_model_warning)
+        self._update_model_info()
         self._sync_ui_state()
 
     def _build_ui(self) -> None:
@@ -1348,6 +1593,13 @@ class AnnotatorWindow(QMainWindow):
         self.open_action.triggered.connect(self._open_folder)
         toolbar.addAction(self.open_action)
 
+        self.open_camera_action = QAction("打开摄像头", self)
+        self.open_camera_action.setToolTip(
+            f"打开设置中选择的本机摄像头（设备 {self.camera_device_index}）；无需先打开数据集。"
+        )
+        self.open_camera_action.triggered.connect(self._open_camera)
+        toolbar.addAction(self.open_camera_action)
+
         self.output_dir_action = QAction("设置标注输出目录", self)
         self.output_dir_action.triggered.connect(self._choose_output_dir)
         toolbar.addAction(self.output_dir_action)
@@ -1362,14 +1614,16 @@ class AnnotatorWindow(QMainWindow):
         self.model_action.triggered.connect(self._choose_model)
         toolbar.addAction(self.model_action)
 
-        self.model_settings_action = QAction("AI 推理设置", self)
+        self.model_settings_action = QAction("设置", self)
+        self.model_settings_action.setToolTip("设置摄像头设备、AI 推理参数、实时验证双模型和标注行为。")
         self.model_settings_action.triggered.connect(self._show_model_settings)
         toolbar.addAction(self.model_settings_action)
 
-        self.validation_mode_action = QAction("显示置信度", self)
+        self.validation_mode_action = QAction("实时验证", self)
         self.validation_mode_action.setCheckable(True)
         self.validation_mode_action.setToolTip(
-            "用当前模型验证画面，并显示与现有标注匹配的置信度；不修改标签。"
+            "对视频或摄像头最新画面运行 YOLO 推理并独立显示检测框与置信度；"
+            "可在设置中选用副模型，不显示、不修改已有标注。"
         )
         self.validation_mode_action.toggled.connect(self._toggle_validation_mode)
         toolbar.addAction(self.validation_mode_action)
@@ -1382,6 +1636,11 @@ class AnnotatorWindow(QMainWindow):
         )
         self.prev_frame_action.triggered.connect(lambda: self._step_frame(-1))
         toolbar.addAction(self.prev_frame_action)
+
+        self.playback_action = QAction("播放", self)
+        self.playback_action.setToolTip("连续播放当前视频；到达最后一帧时自动停止。")
+        self.playback_action.triggered.connect(self._toggle_playback)
+        toolbar.addAction(self.playback_action)
 
         self.next_frame_action = QAction("下一标注帧（D）", self)
         self.next_frame_action.setShortcut("D")
@@ -1432,6 +1691,9 @@ class AnnotatorWindow(QMainWindow):
 
         self.slider = QSlider(Qt.Horizontal)
         self.slider.setRange(0, 0)
+        # 保持 tracking：拖动进度条时连续随机定位并显示对应帧。
+        # 实时验证侧只保留最新待处理帧，不会为每次拖动事件创建推理队列。
+        self.slider.setTracking(True)
         self.slider.valueChanged.connect(self._on_slider_changed)
         self.slider_label = QLabel("0 / 0")
         slider_layout = QHBoxLayout()
@@ -1457,8 +1719,7 @@ class AnnotatorWindow(QMainWindow):
         self.output_dir_lbl.setWordWrap(True)
         self.output_dir_lbl.setToolTip("标注文件、视频帧缓存图片和类别表的统一输出位置；已有标注也只从此目录读取。")
         file_layout.addWidget(self.output_dir_lbl)
-        self.file_filter_label = QLabel("筛选文件：")
-        file_layout.addWidget(self.file_filter_label)
+        self.file_filter_label = QLabel("搜索：")
         self.file_filter = QLineEdit()
         self.file_filter.setPlaceholderText("输入文件名或相对路径关键词")
         self.file_filter.setClearButtonEnabled(True)
@@ -1466,10 +1727,15 @@ class AnnotatorWindow(QMainWindow):
             "按文件名或相对路径筛选文件列表。"
         )
         self.file_filter.textChanged.connect(self._filter_file_list)
+        search_layout = QHBoxLayout()
+        search_layout.setContentsMargins(0, 0, 0, 0)
+        search_layout.setSpacing(6)
+        search_layout.addWidget(self.file_filter_label)
+        search_layout.addWidget(self.file_filter, 1)
         self.file_count_lbl = QLabel("尚未加载文件夹")
         self.file_list_widget = QListWidget()
         self.file_list_widget.currentItemChanged.connect(self._on_file_item_changed)
-        file_layout.addWidget(self.file_filter)
+        file_layout.addLayout(search_layout)
         file_layout.addWidget(self.file_count_lbl)
         file_layout.addWidget(self.file_list_widget, 1)
         file_dock = QDockWidget("文件列表", self)
@@ -1522,9 +1788,14 @@ class AnnotatorWindow(QMainWindow):
             self.is_video and self.current_file is not None and self.total_frames > 0,
             self.multiscale_enabled,
             self.multiscale_sizes,
+            self.show_validation_imgsz,
             self.inference_min_box_side,
             self.manual_replace_overlap_enabled,
             self.manual_replace_overlap_iou,
+            self.camera_device_index,
+            str(self.secondary_model_path or ""),
+            self.validation_model_mode,
+            self.validation_overlap_iou,
             self,
         )
         if dialog.exec_() != QDialog.Accepted:
@@ -1532,22 +1803,94 @@ class AnnotatorWindow(QMainWindow):
 
         try:
             (
-                self.inference_conf,
-                self.inference_iou,
-                self.inference_imgsz,
-                self.inference_max_det,
-                self.inference_min_box_side,
-                self.manual_replace_overlap_enabled,
-                self.manual_replace_overlap_iou,
-                self.frame_step,
-                self.multiscale_enabled,
-                self.multiscale_sizes,
-                self.batch_start_frame,
-                self.batch_end_frame,
+                new_inference_conf,
+                new_inference_iou,
+                new_inference_imgsz,
+                new_inference_max_det,
+                new_inference_min_box_side,
+                new_manual_replace_overlap_enabled,
+                new_manual_replace_overlap_iou,
+                new_frame_step,
+                new_multiscale_enabled,
+                new_multiscale_sizes,
+                new_show_validation_imgsz,
+                new_batch_start_frame,
+                new_batch_end_frame,
+                new_camera_device_index,
+                secondary_model_path_text,
+                new_validation_model_mode,
+                new_validation_overlap_iou,
             ) = dialog.values()
         except ValueError as exc:
-            QMessageBox.warning(self, "多分辨率参数无效", str(exc))
+            QMessageBox.warning(self, "设置参数无效", str(exc))
             return
+
+        # 先验证并加载候选副模型；加载失败时不覆盖当前可用配置。
+        new_secondary_path = None
+        new_secondary_model = None
+        if secondary_model_path_text:
+            new_secondary_path = Path(secondary_model_path_text).expanduser().resolve()
+            if not new_secondary_path.is_file():
+                QMessageBox.warning(
+                    self, "副模型文件不存在", f"找不到副模型权重文件：\n{new_secondary_path}"
+                )
+                return
+            if (
+                self.secondary_model_path == new_secondary_path
+                and self.secondary_ai_model is not None
+            ):
+                new_secondary_model = self.secondary_ai_model
+            else:
+                if not HAS_YOLO:
+                    QMessageBox.warning(
+                        self, "缺少依赖", "缺少 ultralytics，无法加载副模型。\n请先安装：pip install ultralytics"
+                    )
+                    return
+                try:
+                    new_secondary_model = YOLO(str(new_secondary_path))
+                except Exception as exc:
+                    QMessageBox.warning(
+                        self, "副模型加载失败", f"{type(exc).__name__}: {exc}"
+                    )
+                    return
+
+        camera_was_open = self.is_camera
+        old_camera_device_index = self.camera_device_index
+        (
+            self.inference_conf,
+            self.inference_iou,
+            self.inference_imgsz,
+            self.inference_max_det,
+            self.inference_min_box_side,
+            self.manual_replace_overlap_enabled,
+            self.manual_replace_overlap_iou,
+            self.frame_step,
+            self.multiscale_enabled,
+            self.multiscale_sizes,
+            self.show_validation_imgsz,
+            self.batch_start_frame,
+            self.batch_end_frame,
+        ) = (
+            new_inference_conf,
+            new_inference_iou,
+            new_inference_imgsz,
+            new_inference_max_det,
+            new_inference_min_box_side,
+            new_manual_replace_overlap_enabled,
+            new_manual_replace_overlap_iou,
+            new_frame_step,
+            new_multiscale_enabled,
+            new_multiscale_sizes,
+            new_show_validation_imgsz,
+            new_batch_start_frame,
+            new_batch_end_frame,
+        )
+        self.secondary_model_path = new_secondary_path
+        self.secondary_ai_model = new_secondary_model
+        self._update_model_info()
+        self.validation_model_mode = new_validation_model_mode
+        self.validation_overlap_iou = float(new_validation_overlap_iou)
+
         self.app_settings.setValue("inference/conf", self.inference_conf)
         self.app_settings.setValue("inference/iou", self.inference_iou)
         self.app_settings.setValue("inference/imgsz", self.inference_imgsz)
@@ -1562,19 +1905,47 @@ class AnnotatorWindow(QMainWindow):
         )
         self.app_settings.setValue("inference/multiscale_enabled", self.multiscale_enabled)
         self.app_settings.setValue("inference/multiscale_sizes", self.multiscale_sizes)
-        self.app_settings.setValue("video/frame_step", self.frame_step)
-        self.app_settings.sync()
-        self.status_lbl.setText(
-            "AI 推理参数已保存："
-            f"conf={self.inference_conf:.2f}, iou={self.inference_iou:.2f}, "
-            f"单尺度尺寸={self.inference_imgsz}, max_det={self.inference_max_det}, "
-            f"最小目标边长={self.inference_min_box_side}px, "
-            f"新框重叠清理={self.manual_replace_overlap_enabled} "
-            f"(IoU={self.manual_replace_overlap_iou:.2f}), "
-            f"多分辨率推理={self.multiscale_enabled} ({self.multiscale_sizes}), "
-            f"批量采样间隔={self.frame_step} 帧, "
-            f"当前视频批量范围={self.batch_start_frame}-{self.batch_end_frame}"
+        self.app_settings.setValue(
+            "inference/show_validation_imgsz", self.show_validation_imgsz
         )
+        self.app_settings.setValue("video/frame_step", self.frame_step)
+        camera_device_changed = new_camera_device_index != self.camera_device_index
+        self.camera_device_index = new_camera_device_index
+        self.app_settings.setValue("camera/device_index", self.camera_device_index)
+        self.app_settings.setValue(
+            "validation/secondary_model_path",
+            str(self.secondary_model_path) if self.secondary_model_path is not None else "",
+        )
+        self.app_settings.setValue("validation/dual_model_mode", self.validation_model_mode)
+        self.app_settings.setValue("validation/dual_model_overlap_iou", self.validation_overlap_iou)
+        self.app_settings.sync()
+        self.open_camera_action.setToolTip(
+            f"打开设置中选择的本机摄像头（设备 {self.camera_device_index}）；无需先打开数据集。"
+        )
+        if camera_device_changed and camera_was_open:
+            # 设置应用后立即重启采集线程，切换到新设备；保持当前实时验证开关状态。
+            self.status_lbl.setText(
+                f"正在切换摄像头设备：{old_camera_device_index} → {self.camera_device_index}……"
+            )
+            self._open_camera()
+        else:
+            self.status_lbl.setText(
+                "设置已保存："
+                f"conf={self.inference_conf:.2f}, iou={self.inference_iou:.2f}, "
+                f"单尺度尺寸={self.inference_imgsz}, max_det={self.inference_max_det}, "
+                f"最小目标边长={self.inference_min_box_side}px, "
+                f"新框重叠清理={self.manual_replace_overlap_enabled} "
+                f"(IoU={self.manual_replace_overlap_iou:.2f}), "
+                f"多分辨率推理={self.multiscale_enabled} ({self.multiscale_sizes}), "
+                f"批量采样间隔={self.frame_step} 帧, "
+                f"当前视频批量范围={self.batch_start_frame}-{self.batch_end_frame}, "
+                f"摄像头设备={self.camera_device_index}"
+            )
+        if self.validation_mode:
+            # 应用参数后使旧配置的在途结果失效；线程结束后会自动补做最新请求。
+            self.validation_generation += 1
+            if self.frame is not None and not (camera_device_changed and camera_was_open):
+                self._run_validation()
 
     # ---------- 模型 ----------
 
@@ -1600,10 +1971,15 @@ class AnnotatorWindow(QMainWindow):
             return False
 
         try:
-            self.ai_model = YOLO(str(path))
+            loaded_model = YOLO(str(path))
+            if self.validation_mode:
+                self.validation_generation += 1
+            self.ai_model = loaded_model
             self.model_path = path.resolve()
             if not self.classes:
                 self.classes = self._names_from_model(self.ai_model)
+            self.app_settings.setValue("model/last_path", str(self.model_path))
+            self.app_settings.sync()
             self._update_model_info()
             self.status_lbl.setText(f"模型已加载：{path}")
             self._sync_ui_state()
@@ -1622,11 +1998,18 @@ class AnnotatorWindow(QMainWindow):
 
     def _update_model_info(self) -> None:
         if self.model_path is None or self.ai_model is None:
-            text = "当前模型：未加载"
+            text = "主模型：未加载"
             tooltip = text
         else:
-            text = f"当前模型：{self.model_path.name}"
+            text = f"主模型：{self.model_path.name}"
             tooltip = str(self.model_path)
+        if self.secondary_model_path is not None:
+            if self.secondary_ai_model is not None:
+                text += f"\n实时验证副模型：{self.secondary_model_path.name}"
+                tooltip += f"\n实时验证副模型：{self.secondary_model_path}"
+            else:
+                text += "\n实时验证副模型：未加载"
+                tooltip += f"\n副模型路径：{self.secondary_model_path}"
         self.model_info_lbl.setText(text)
         self.model_info_lbl.setToolTip(tooltip)
 
@@ -1800,8 +2183,12 @@ class AnnotatorWindow(QMainWindow):
                         return False
                     suffix = candidate.suffix.lower()
                     if layout_mode == "video_dataset":
-                        # 视频复核数据集只导入视频；images/ 中的抽帧缓存不作为独立图片。
-                        if suffix not in VIDEO_SUFFIXES:
+                        # 视频数据集仍排除 images/ 抽帧缓存；仅额外导入程序抓拍的 camera_captures/ 图片。
+                        is_camera_capture = (
+                            suffix in IMAGE_SUFFIXES
+                            and "camera_captures" in candidate.relative_to(media_dir).parts[:-1]
+                        )
+                        if suffix not in VIDEO_SUFFIXES and not is_camera_capture:
                             return False
                     elif layout_mode == "image_dataset":
                         if suffix not in IMAGE_SUFFIXES:
@@ -2223,14 +2610,22 @@ class AnnotatorWindow(QMainWindow):
         self.status_lbl.setText(message)
 
     def _load_file(self, path: Path) -> bool:
+        # 切回普通媒体前先停止摄像头采集，确保设备不会被两个来源同时占用。
+        if (self.is_camera or self.camera_thread is not None) and not self._stop_camera():
+            return False
+        # 媒体切换只使旧推理结果失效，不强制中断正在运行的 YOLO 调用。
+        self.validation_generation += 1
         self._activate_file_dataset_context(path)
         self._clear_media_label_path_cache(path)
         self._stop_playback()
+        self.video_fps = 30.0
         if self.cap is not None:
             self.cap.release()
             self.cap = None
 
         self.annotations = {}
+        self.validation_boxes = []
+        self.canvas.set_validation_boxes([])
         self.frame_idx = 0
         self.frame = None
         self.current_file = path
@@ -2253,6 +2648,9 @@ class AnnotatorWindow(QMainWindow):
                 return False
 
             self.cap = cap
+            reported_fps = float(cap.get(cv2.CAP_PROP_FPS))
+            if np.isfinite(reported_fps) and reported_fps > 0:
+                self.video_fps = min(reported_fps, 240.0)
             frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             if frame_count <= 0:
                 # 部分视频容器无法提供帧数或不支持随机定位，至少允许标注首帧。
@@ -2334,9 +2732,229 @@ class AnnotatorWindow(QMainWindow):
 
         self._set_file_list_current()
         self._sync_ui_state()
-        if not self.is_video and self.validation_mode:
+        if self.validation_mode:
             self._run_validation()
         return True
+
+    def _open_camera(self) -> None:
+        """打开设置中选定的本机摄像头；无需预先打开数据集目录。"""
+        if not self._confirm_unsaved_changes():
+            return
+        if self.predicting or (self.batch_thread is not None and self.batch_thread.isRunning()):
+            self.status_lbl.setText("当前 AI 任务尚未完成，暂时无法打开摄像头。")
+            return
+        if (self.is_camera or self.camera_thread is not None) and not self._stop_camera():
+            return
+
+        self.validation_generation += 1
+        self._stop_playback()
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = None
+        self.current_file = None
+        self._set_dirty(False)
+        self.is_video = False
+        self.total_frames = 0
+        self.frame_idx = 0
+        self.frame = None
+        self.image_w = 0
+        self.image_h = 0
+        self.annotations = {}
+        self.validation_boxes = []
+        self.canvas.set_validation_boxes([])
+        self.canvas.set_boxes([])
+        self.canvas.clear_frame()
+        self.canvas.reset_view()
+        self.camera_last_sequence = -1
+        self.is_camera = True
+        self.is_playing = bool(self.validation_mode)
+        self.file_index = -1
+        self._set_file_list_current()
+
+        thread = CameraCaptureThread(self.camera_device_index)
+        thread.setParent(self)
+        self.camera_thread = thread
+        thread.error_signal.connect(self._on_camera_error)
+        thread.finished.connect(self._on_camera_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+        self.camera_timer.start()
+        self.status_lbl.setText(f"正在连接本机摄像头（设备 {self.camera_device_index}）……")
+        self._sync_ui_state()
+
+    def _on_camera_error(self, message: str) -> None:
+        if self.sender() is not self.camera_thread:
+            return
+        self.camera_timer.stop()
+        self.is_camera = False
+        self.is_playing = False
+        self.validation_generation += 1
+        self.validation_boxes = []
+        self.canvas.set_validation_boxes([])
+        self.status_lbl.setText(message)
+        self._sync_ui_state()
+
+    def _on_camera_thread_finished(self) -> None:
+        thread = self.sender()
+        if thread is self.camera_thread:
+            self.camera_thread = None
+            if self.is_camera:
+                self.camera_timer.stop()
+                self.is_camera = False
+                self.is_playing = False
+                self.validation_generation += 1
+                self.status_lbl.setText("摄像头采集已停止。")
+                self._sync_ui_state()
+
+    def _stop_camera(self) -> bool:
+        """停止摄像头线程；若驱动未及时返回，不释放仍在运行的 QThread。"""
+        self.camera_timer.stop()
+        self.is_playing = False
+        thread = self.camera_thread
+        if thread is not None:
+            thread.request_stop()
+            if not thread.wait(3000):
+                self.status_lbl.setText(
+                    "摄像头采集线程尚未退出，暂时无法切换媒体；请检查摄像头驱动是否卡住。"
+                )
+                return False
+            self.camera_thread = None
+        self.is_camera = False
+        self.camera_last_sequence = -1
+        self._update_playback_action()
+        return True
+
+    def _update_camera_frame(self) -> None:
+        """从采集线程的单帧缓冲区取最新画面；不在 Qt 事件队列中积压帧。"""
+        if not self.is_camera or self.camera_thread is None:
+            return
+        if self.validation_mode and not self.is_playing:
+            return
+        sequence, frame = self.camera_thread.latest_frame()
+        if frame is None or sequence == self.camera_last_sequence:
+            return
+        first_frame = self.frame is None
+        self.camera_last_sequence = sequence
+        self.frame = frame
+        self.frame_idx = sequence
+        self.image_h, self.image_w = frame.shape[:2]
+        self.canvas.set_frame(frame)
+        self.canvas.set_boxes([])
+        self.canvas.set_validation_boxes(self.validation_boxes if self.validation_mode else [])
+        self.slider_label.setText("摄像头实时画面")
+        self.tree.clear()
+        if self.validation_mode:
+            self._run_validation()
+        if first_frame:
+            self._sync_ui_state()
+
+    def _camera_capture_destination(self) -> tuple[Path, str]:
+        """返回抓拍目录和对应的数据集上下文键。"""
+        active_context = self.dataset_contexts.get(self.active_dataset_key or "")
+        if (
+            self.media_dir is not None
+            and self.current_labels_dir is not None
+            and active_context is not None
+        ):
+            # 已打开数据集时延续原有抓拍分组及标签相对路径，不改变数据集布局。
+            capture_dir = (
+                self.media_dir
+                if active_context.get("camera_default_capture_root")
+                else self.media_dir / "camera_captures"
+            )
+            return capture_dir, str(self.active_dataset_key)
+
+        # 没有已打开的数据集时，使用脚本所在目录作为独立 YOLO 数据集根目录。
+        dataset_root = SCRIPT_DIR
+        media_dir = dataset_root / "images"
+        labels_dir = dataset_root / "labels"
+        media_dir.mkdir(parents=True, exist_ok=True)
+        labels_dir.mkdir(parents=True, exist_ok=True)
+
+        context_key = str(dataset_root.resolve())
+        context = self.dataset_contexts.get(context_key)
+        if context is None:
+            context = {
+                "dataset_root": dataset_root,
+                "media_dir": media_dir,
+                "labels_relative_dir": Path("labels"),
+                "frame_images_relative_dir": Path("images"),
+                "source_classes_file": dataset_root / "classes.txt",
+                "layout_mode": "image_dataset",
+                "output_root": dataset_root,
+                "label_index_cache": {},
+                "resolved_label_paths": {},
+                "nested_roots": [],
+                "classes": None,
+                "last_class_name": None,
+                "camera_default_capture_root": True,
+            }
+            self.dataset_contexts[context_key] = context
+        else:
+            # 复用已有脚本目录上下文中的类别、输出路径和标签路径缓存。
+            context["dataset_root"] = dataset_root
+            context["media_dir"] = media_dir
+            context["labels_relative_dir"] = Path("labels")
+            context["frame_images_relative_dir"] = Path("images")
+            context["source_classes_file"] = dataset_root / "classes.txt"
+            context["layout_mode"] = "image_dataset"
+            context["output_root"] = dataset_root
+            context["camera_default_capture_root"] = True
+
+        self._store_active_dataset_context_state()
+        self.active_dataset_key = None
+        self.browse_root = dataset_root
+        return media_dir, context_key
+
+    def _register_camera_capture(self, image_path: Path, context_key: str) -> None:
+        """将新抓拍图片加入当前数据集文件列表，并绑定正确的数据集上下文。"""
+        resolved_path = image_path.resolve()
+        self.file_dataset_keys[resolved_path] = context_key
+        self.file_list = [
+            path for path in self.file_list if path.resolve() != resolved_path
+        ]
+        self.file_list.append(image_path)
+        self.file_list.sort(
+            key=lambda path: (
+                str(path.relative_to(self.browse_root)).casefold()
+                if self.browse_root is not None and self.browse_root in path.parents
+                else str(path).casefold()
+            )
+        )
+        self.file_index = self.file_list.index(image_path)
+        self._refresh_file_list()
+
+    def _capture_camera_frame(self) -> None:
+        """保存当前摄像头画面，再作为普通图片载入现有标注流程。"""
+        if not self.is_camera or self.frame is None:
+            return
+        try:
+            capture_dir, context_key = self._camera_capture_destination()
+            capture_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            image_path = capture_dir / f"camera_{timestamp}.jpg"
+            if not save_image_unicode(image_path, self.frame.copy()):
+                raise OSError(f"抓拍图片保存失败：{image_path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "摄像头抓拍失败", f"{type(exc).__name__}: {exc}")
+            return
+
+        if not self._stop_camera():
+            return
+        self.validation_generation += 1
+        if self.validation_mode:
+            self.validation_mode = False
+            self.validation_mode_action.blockSignals(True)
+            self.validation_mode_action.setChecked(False)
+            self.validation_mode_action.blockSignals(False)
+            self.canvas.set_validation_mode(False)
+        self._register_camera_capture(image_path, context_key)
+        if not self._load_file(image_path):
+            self.status_lbl.setText(f"抓拍图片已保存，但无法载入标注界面：{image_path}")
+            return
+        self.status_lbl.setText(
+            f"已抓拍并打开图片：{image_path.name}。现在可以进行人工标注。"
+        )
 
     # ---------- YOLO 标签读取 ----------
 
@@ -2428,6 +3046,10 @@ class AnnotatorWindow(QMainWindow):
 
         self.canvas.set_frame(self.frame, reset_view=reset_view)
         self.canvas.set_boxes(self.annotations.get(self.frame_idx, []))
+        if self.validation_mode:
+            self.canvas.set_validation_boxes(self.validation_boxes)
+        else:
+            self.canvas.set_validation_boxes([])
 
         self.slider.blockSignals(True)
         self.slider.setValue(self.frame_idx)
@@ -2436,6 +3058,7 @@ class AnnotatorWindow(QMainWindow):
         self._refresh_tree()
 
     def _seek(self, index: int, reset_view: bool = False) -> None:
+        """随机定位到指定帧；仅用于用户跳转，不用于连续播放。"""
         if not self.is_video or self.cap is None or self.total_frames <= 0:
             return
         index = min(max(int(index), 0), self.total_frames - 1)
@@ -2444,7 +3067,14 @@ class AnnotatorWindow(QMainWindow):
         if not ok or frame is None:
             self.status_lbl.setText(f"无法读取第 {index + 1} 帧。")
             return
+        self._display_video_frame(index, frame, reset_view=reset_view)
 
+    def _display_video_frame(
+        self, index: int, frame: np.ndarray, reset_view: bool = False
+    ) -> None:
+        """显示已顺序读取或随机读取的视频帧，并统一处理标签和验证状态。"""
+        # 视频控制只负责更新当前画面；实时验证独立消费最新帧。
+        # 无论连续播放还是手动随机定位，都保留当前检测框，直到下一次推理完成。
         self.frame = frame
         self.frame_idx = index
         self.image_h, self.image_w = frame.shape[:2]
@@ -2531,6 +3161,7 @@ class AnnotatorWindow(QMainWindow):
         """跳转到前一个 / 后一个包含标注框的视频帧，而非固定步长帧。"""
         if not self.is_video or self.predicting:
             return
+        self._stop_playback()
 
         marked_frames = self._marked_video_frame_indices()
         if delta < 0:
@@ -2558,6 +3189,7 @@ class AnnotatorWindow(QMainWindow):
 
     def _on_slider_changed(self, value: int) -> None:
         if self.is_video and value != self.frame_idx:
+            self._stop_playback()
             self._seek(value)
 
     def _refresh_file_list(self) -> None:
@@ -2699,8 +3331,6 @@ class AnnotatorWindow(QMainWindow):
             )
         else:
             self.status_lbl.setText("已添加人工标注框。")
-        if self.validation_mode:
-            self._run_validation()
 
     def _on_canvas_box_selected(self, index: int) -> None:
         """画布点击框时同步选中右侧列表项目。"""
@@ -2720,6 +3350,8 @@ class AnnotatorWindow(QMainWindow):
 
     def _refresh_tree(self) -> None:
         self.tree.clear()
+        if self.validation_mode:
+            return
         boxes = self.annotations.get(self.frame_idx, [])
         root = QTreeWidgetItem([f"第 {self.frame_idx + 1} 帧", f"{len(boxes)} 个标注框"])
         self.tree.addTopLevelItem(root)
@@ -2776,8 +3408,6 @@ class AnnotatorWindow(QMainWindow):
         self.last_class_name = name
         self._set_dirty(True)
         self._refresh_frame()
-        if self.validation_mode:
-            self._run_validation()
 
     def eventFilter(self, watched, event) -> bool:
         """在主工作区响应 Backspace，同时保留文本输入控件的原生退格行为。"""
@@ -2812,8 +3442,6 @@ class AnnotatorWindow(QMainWindow):
         self._set_dirty(True)
         self._refresh_frame()
         self.status_lbl.setText("已删除选中的标注框。")
-        if self.validation_mode:
-            self._run_validation()
 
     # ---------- AI 预标注 ----------
 
@@ -2823,103 +3451,211 @@ class AnnotatorWindow(QMainWindow):
         return (int(self.inference_imgsz),)
 
     def _toggle_validation_mode(self, enabled: bool) -> None:
-        """切换置信度验证叠加；验证只读取推理结果，不改写标注框。"""
+        """切换独立实时验证层；验证检测框不进入标注数据。"""
         enabled = bool(enabled)
         if enabled and self.ai_model is None:
             self.validation_mode_action.blockSignals(True)
             self.validation_mode_action.setChecked(False)
             self.validation_mode_action.blockSignals(False)
-            self.validation_mode = False
-            QMessageBox.information(self, "需要 YOLO 模型", "请先加载 YOLO 权重，再启用验证模式。")
+            QMessageBox.information(self, "需要 YOLO 模型", "请先加载 YOLO 权重，再启用实时验证。")
             return
 
+        self.validation_generation += 1
         self.validation_mode = enabled
+        if self.is_camera:
+            self.is_playing = enabled
+            if not self.camera_timer.isActive():
+                self.camera_timer.start()
+        self.validation_boxes = []
         self.canvas.set_validation_mode(enabled)
+        self.canvas.set_validation_boxes([])
+        self._sync_ui_state()
         if not enabled:
-            for box in self.annotations.get(self.frame_idx, []):
-                box.pop("validation_confidence", None)
-            self._refresh_frame()
-            self.status_lbl.setText("验证模式已关闭；标注框保持不变。")
+            if self.is_camera:
+                self.is_playing = False
+                self._update_camera_frame()
+                self._update_playback_action()
+            else:
+                self._refresh_frame()
+            self.status_lbl.setText("实时验证已关闭，恢复普通画面显示。")
             return
+        if self.is_camera:
+            if self.frame is not None:
+                self._run_validation()
+            self._update_playback_action()
+        else:
+            self._refresh_frame()
+            self._run_validation()
 
-        self._run_validation()
+    def _validation_source_key(self) -> Optional[str]:
+        if self.is_camera:
+            return f"camera:{self.camera_device_index}"
+        return str(self.current_file) if self.current_file is not None else None
+
+    def _validation_request_signature(
+        self, imgsz_values: Optional[tuple[int, ...]] = None
+    ) -> Optional[tuple]:
+        """返回当前待验证画面的身份及推理参数，用于判断是否需要补做最新帧。"""
+        source_key = self._validation_source_key()
+        if (
+            not self.validation_mode
+            or self.ai_model is None
+            or source_key is None
+            or self.frame is None
+        ):
+            return None
+        if imgsz_values is None:
+            try:
+                imgsz_values = self._active_imgsz_values()
+            except ValueError:
+                return None
+        return (
+            self.validation_generation,
+            source_key,
+            int(self.frame_idx),
+            id(self.ai_model),
+            id(self.secondary_ai_model) if self.secondary_ai_model is not None else None,
+            str(self.secondary_model_path) if self.secondary_model_path is not None else None,
+            self.validation_model_mode,
+            float(self.validation_overlap_iou),
+            float(self.inference_conf),
+            float(self.inference_iou),
+            tuple(imgsz_values),
+            int(self.inference_max_det),
+            int(self.inference_min_box_side),
+        )
 
     def _run_validation(self) -> None:
-        """推理当前画面，并将检测置信度匹配到已有的同类别标注框。"""
+        """异步推理当前画面；忙碌时不排队，线程结束后只补做最新且不同的画面。"""
         if not self.validation_mode or self.ai_model is None:
             return
-        if self.current_file is None or self.frame is None:
-            return
-        if self.predicting:
+        source_key = self._validation_source_key()
+        if source_key is None or self.frame is None:
             return
 
         try:
             active_imgsz_values = self._active_imgsz_values()
         except ValueError as exc:
-            self.status_lbl.setText(f"无法启动验证：{exc}")
-            QMessageBox.warning(self, "验证参数无效", str(exc))
+            self.status_lbl.setText(f"无法启动实时验证：{exc}")
+            QMessageBox.warning(self, "实时验证参数无效", str(exc))
             return
 
-        for box in self.annotations.get(self.frame_idx, []):
-            box.pop("validation_confidence", None)
+        request_signature = self._validation_request_signature(active_imgsz_values)
+        if request_signature is None:
+            return
+        if self.validation_thread is not None:
+            # 不保存帧队列，也不逐帧排队；当前 self.frame 始终代表最新画面。
+            # 推理结束时比较签名，只有最新画面/会话/参数确实变化才启动下一次推理。
+            return
 
-        self.predicting = True
-        self._sync_ui_state()
+        # 保留当前显示的上一帧结果；新帧推理完成后再一次性替换，避免框闪烁。
+        # 该线程独立于播放和标注任务，视频播放不等待推理完成。
         self.status_lbl.setText(
-            f"验证中：{self.current_file.name}，第 {self.frame_idx + 1} 帧……"
+            f"摄像头实时验证中：采集帧 {self.frame_idx}……"
+            if self.is_camera
+            else f"实时验证中：{self.current_file.name}，第 {self.frame_idx + 1} 帧……"
         )
-        self.predict_thread = PredictThread(
+        thread = PredictThread(
             self.ai_model,
             self.frame,
-            str(self.current_file),
+            source_key,
             self.frame_idx,
             self.inference_conf,
             self.inference_iou,
             active_imgsz_values,
             self.inference_max_det,
             self.inference_min_box_side,
+            secondary_model=self.secondary_ai_model,
+            dual_model_mode=self.validation_model_mode,
+            dual_model_overlap_iou=self.validation_overlap_iou,
         )
-        self.predict_thread.finished_signal.connect(self._on_validation_finished)
-        self.predict_thread.error_signal.connect(self._on_validation_error)
-        self.predict_thread.finished.connect(self._on_ai_thread_stopped)
-        self.predict_thread.start()
+        # 记录媒体/验证会话；同一会话内允许较早帧的结果更新当前画面，
+        # 但切换媒体或验证模式后，旧会话结果必须丢弃。
+        thread.validation_generation = self.validation_generation
+        thread.validation_signature = request_signature
+        # 由窗口 QObject 持有线程对象，直到 finished 信号确认线程已退出。
+        # finished 后再安排 deleteLater，避免快速拖动触发帧切换时过早销毁运行中的 QThread。
+        thread.setParent(self)
+        self.validation_thread = thread
+        thread.finished_signal.connect(self._on_validation_finished)
+        thread.error_signal.connect(self._on_validation_error)
+        thread.finished.connect(self._on_validation_thread_stopped)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+        self._sync_ui_state()
 
     def _on_validation_finished(
         self, file_path: str, frame_index: int, detections: list
     ) -> None:
+        # 同一媒体会话内，结果允许晚于对应帧到达：这正是异步播放的预期行为。
+        # 只按媒体/验证会话过滤，不按当前 frame_idx 过滤，否则播放越流畅越容易丢光结果。
+        thread = self.sender()
         if (
-            self.current_file is None
-            or str(self.current_file) != file_path
-            or self.frame_idx != frame_index
+            not self.validation_mode
+            or self._validation_source_key() != file_path
+            or thread is None
+            or getattr(thread, "validation_generation", -1) != self.validation_generation
         ):
-            self.status_lbl.setText("验证结果对应的画面已切换，结果未应用。")
             return
 
-        boxes = self.annotations.get(frame_index, [])
-        for box in boxes:
-            box.pop("validation_confidence", None)
-
-        # 按类别与 IoU 一对一匹配，避免单个检测框被重复分配给多个标注框。
-        # 置信度只作为画面复核信息，不写入标准五列 YOLO 标签。
-        matched = match_detection_confidences(
-            boxes, detections, self.validation_match_iou
+        self.validation_boxes = [
+            {
+                "class_id": int(detection["model_class_id"]),
+                "class_name": str(detection["class_name"]),
+                "model_index": detection.get("model_index"),
+                "x1": float(detection["x1"]),
+                "y1": float(detection["y1"]),
+                "x2": float(detection["x2"]),
+                "y2": float(detection["y2"]),
+                "confidence": float(detection["confidence"]),
+                "source_imgsz": detection.get("source_imgsz"),
+                "show_source_imgsz": bool(self.show_validation_imgsz and self.multiscale_enabled),
+            }
+            for detection in detections
+        ]
+        self.canvas.set_validation_boxes(self.validation_boxes)
+        secondary_warning = getattr(thread, "secondary_warning", None)
+        status_text = (
+            f"摄像头实时验证完成：检测到 {len(self.validation_boxes)} 个目标。"
+            if self.is_camera
+            else f"实时验证完成：第 {frame_index + 1} 帧检测到 {len(self.validation_boxes)} 个目标。"
         )
-        for box_index, confidence in matched.items():
-            boxes[box_index]["validation_confidence"] = confidence
+        if secondary_warning:
+            status_text += f" 副模型推理失败，已仅显示主模型结果：{secondary_warning}"
+        self.status_lbl.setText(status_text)
 
-        if frame_index == self.frame_idx:
-            self._refresh_frame()
-        total = len(boxes)
-        self.status_lbl.setText(
-            f"验证完成：{len(matched)} / {total} 个标注框匹配到模型检测结果；"
-            f"匹配条件：类别一致、IoU ≥ {self.validation_match_iou:.2f}。"
-            if total else "验证完成：当前画面没有已有标注框。"
-        )
+    def _on_validation_thread_stopped(self) -> None:
+        """在线程确实结束后回收引用，再对最新画面补做一次推理。"""
+        thread = self.sender()
+        # 只清理发出 finished 的线程；旧回调不能清除其他推理任务的引用。
+        if thread is None or thread is not self.validation_thread:
+            return
+        # QThread.finished 在 run() 返回后发出，此时线程已结束，可以安全释放引用。
+        self.validation_thread = None
+        self._sync_ui_state()
+        # 只比较当前最新请求与刚结束的请求；中间帧不排队、不追赶。
+        # 即使播放/拖动期间经过很多帧，也只会再推理此刻最新的那一帧。
+        current_signature = self._validation_request_signature()
+        if current_signature is not None and current_signature != getattr(
+            thread, "validation_signature", None
+        ):
+            self._run_validation()
 
     def _on_validation_error(self, file_path: str, frame_index: int, error: str) -> None:
-        if self.current_file is not None and str(self.current_file) == file_path:
-            self.status_lbl.setText(f"验证失败：{error}")
-            QMessageBox.warning(self, "验证失败", error)
+        thread = self.sender()
+        if (
+            self.validation_mode
+            and self._validation_source_key() == file_path
+            and thread is not None
+            and getattr(thread, "validation_generation", -1) == self.validation_generation
+        ):
+            # 单帧推理失败不清除上一组有效结果，也不弹出模态窗口打断播放。
+            prefix = (
+                "摄像头实时验证失败"
+                if self.is_camera
+                else f"实时验证失败（第 {frame_index + 1} 帧）"
+            )
+            self.status_lbl.setText(f"{prefix}，保留上次检测结果：{error}")
 
     def _run_ai_predict(self) -> None:
         if self.ai_model is None:
@@ -2931,10 +3667,11 @@ class AnnotatorWindow(QMainWindow):
             return
         if self.frame is None or self.current_file is None:
             return
-        if self.predicting:
-            self.status_lbl.setText("AI 预标注正在执行，请等待当前任务完成。")
+        if self.predicting or self.validation_thread is not None:
+            self.status_lbl.setText("当前 YOLO 推理尚未完成，请稍后再启动 AI 预标注。")
             return
 
+        self._stop_playback()
         self.predicting = True
         self._sync_ui_state()
         self.status_lbl.setText(
@@ -2986,7 +3723,6 @@ class AnnotatorWindow(QMainWindow):
                 "y2": box["y2"],
                 "source": "ai",
                 "confidence": float(box.get("confidence", 0.0)),
-                "validation_confidence": float(box.get("confidence", 0.0)),
             })
 
         # 如果模型确实返回了目标、但类别名称一个都无法映射，保留原标注，
@@ -3044,6 +3780,9 @@ class AnnotatorWindow(QMainWindow):
         self.status_lbl.setText(message)
 
     def _run_batch_ai_predict(self) -> None:
+        if self.validation_thread is not None:
+            self.status_lbl.setText("实时验证推理尚未完成，请稍后再启动批量 AI 预标注。")
+            return
         if self.ai_model is None:
             QMessageBox.warning(self, "模型不可用", "请先加载 YOLO 权重。")
             return
@@ -3077,6 +3816,7 @@ class AnnotatorWindow(QMainWindow):
         if answer != QMessageBox.Yes:
             return
 
+        self._stop_playback()
         self.batch_added_count = 0
         self.batch_error_count = 0
         self.batch_skipped_count = 0
@@ -3160,6 +3900,7 @@ class AnnotatorWindow(QMainWindow):
         self._sync_ui_state()
 
     def _stop_batch_ai_predict(self) -> None:
+        self._stop_playback()
         if self.batch_thread is not None and self.batch_thread.isRunning():
             self.batch_thread.request_stop()
             self.batch_stop_action.setEnabled(False)
@@ -3174,6 +3915,8 @@ class AnnotatorWindow(QMainWindow):
         self.predicting = False
         self.predict_thread = None
         self._sync_ui_state()
+        if self.is_playing:
+            self._schedule_playback_step()
 
     # ---------- 清理标注 ----------
 
@@ -3426,29 +4169,136 @@ class AnnotatorWindow(QMainWindow):
             return True
         return False
 
+    def _toggle_playback(self) -> None:
+        """视频模式切换播放；摄像头验证模式切换播放，标注模式执行抓拍。"""
+        if self.is_camera:
+            if not self.validation_mode:
+                self._capture_camera_frame()
+                return
+            self.is_playing = not self.is_playing
+            if self.is_playing:
+                self.camera_timer.start()
+                self._update_camera_frame()
+                self.status_lbl.setText("摄像头实时验证已继续。")
+            else:
+                self.status_lbl.setText("摄像头实时验证已暂停。")
+            self._update_playback_action()
+            return
+
+        if self.is_playing:
+            self._stop_playback()
+            self.status_lbl.setText("视频播放已暂停。")
+            return
+
+        if not self.is_video or self.cap is None or self.total_frames <= 1:
+            return
+        if self.predicting:
+            self.status_lbl.setText("当前 AI 预标注任务尚未完成，暂时无法播放。")
+            return
+
+        self.is_playing = True
+        self._update_playback_action()
+        if self.frame_idx >= self.total_frames - 1:
+            self._seek(0)
+        if not self.predicting:
+            self.status_lbl.setText("视频正在播放。")
+            self._schedule_playback_step()
+
+    def _update_playback_action(self) -> None:
+        if not hasattr(self, "playback_action"):
+            return
+        if self.is_camera and not self.validation_mode:
+            self.playback_action.setText("抓拍")
+            self.playback_action.setToolTip("抓取当前摄像头画面并进入普通图片标注。")
+        elif self.is_camera:
+            self.playback_action.setText("暂停" if self.is_playing else "播放")
+            self.playback_action.setToolTip(
+                "暂停摄像头画面更新与实时验证。" if self.is_playing
+                else "继续摄像头画面更新与实时验证。"
+            )
+        else:
+            self.playback_action.setText("暂停" if self.is_playing else "播放")
+            self.playback_action.setToolTip(
+                "暂停当前视频播放。" if self.is_playing
+                else "连续播放当前视频；到达最后一帧时自动停止。"
+            )
+
+    def _schedule_playback_step(self) -> None:
+        if not self.is_playing or not self.is_video or self.predicting:
+            return
+        fps = self.video_fps if np.isfinite(self.video_fps) and self.video_fps > 0 else 30.0
+        interval_ms = max(1, int(round(1000.0 / fps)))
+        if not self.playback_timer.isActive():
+            self.playback_timer.start(interval_ms)
+        else:
+            self.playback_timer.setInterval(interval_ms)
+
+    def _advance_playback(self) -> None:
+        if not self.is_playing or not self.is_video:
+            return
+        if self.predicting:
+            # 标注类 AI 任务仍然独占视频；实时验证不设置 predicting，不会进入此分支。
+            self.playback_timer.stop()
+            return
+
+        next_index = self.frame_idx + 1
+        if next_index >= self.total_frames:
+            self._stop_playback()
+            self.status_lbl.setText("视频播放结束。")
+            return
+
+        # 连续播放必须顺序解码：当前帧读取后，VideoCapture 的内部位置已经指向下一帧。
+        # 这里直接 read()，绝不对每一帧调用 CAP_PROP_POS_FRAMES 随机定位。
+        ok, frame = self.cap.read()
+        if not ok or frame is None:
+            self._stop_playback()
+            self.status_lbl.setText("视频播放结束或无法继续读取视频帧。")
+            return
+        self._display_video_frame(next_index, frame)
+        if self.frame_idx != next_index:
+            self._stop_playback()
+            return
+        # 周期定时器会按视频 FPS 自动触发下一帧；不等待实时验证线程。
+
     def _stop_playback(self) -> None:
-        # 当前版本采用逐帧手动查看，不启用自动播放；保留此接口供画布事件调用。
-        return
+        self.is_playing = False
+        if hasattr(self, "playback_timer"):
+            self.playback_timer.stop()
+        self._update_playback_action()
 
     def _sync_ui_state(self) -> None:
         has_file = self.current_file is not None and self.frame is not None
+        has_camera = self.is_camera and self.frame is not None
+        has_media = has_file or has_camera
         has_video = has_file and self.is_video
+        # finished 回调处理前仍保持 busy，避免在 Qt 信号队列清理线程引用前
+        # 再次启动同类推理任务。
+        validation_busy = self.validation_thread is not None
         self.open_action.setEnabled(not self.predicting)
+        self.open_camera_action.setEnabled(
+            not self.predicting
+            and not (self.batch_thread is not None and self.batch_thread.isRunning())
+        )
         self.output_dir_action.setEnabled(
             self.media_dir is not None and not self.predicting
         )
-        self.model_action.setEnabled(not self.predicting)
-        self.model_settings_action.setEnabled(not self.predicting)
+        self.model_action.setEnabled(not self.predicting and not validation_busy)
+        self.model_settings_action.setEnabled(not self.predicting and not validation_busy)
         self.validation_mode_action.setEnabled(
-            has_file and self.ai_model is not None and not self.predicting
+            has_media and self.ai_model is not None and not self.predicting
         )
         self.save_action.setEnabled(has_file and not self.predicting)
-        self.canvas.setEnabled(has_file and not self.predicting)
-        self.slider.setEnabled(has_video and not self.predicting)
-        self.tree.setEnabled(has_file and not self.predicting)
-        self.ai_action.setEnabled(has_file and self.ai_model is not None and not self.predicting)
+        self.canvas.setEnabled(has_media and not self.predicting)
+        self.slider.setEnabled(has_file and self.is_video and not self.predicting)
+        self.tree.setEnabled(has_file and not self.predicting and not self.validation_mode)
+        self.tree.setVisible(has_file and not self.validation_mode)
+        self.ai_action.setEnabled(
+            has_file and self.ai_model is not None and not self.predicting
+            and not validation_busy and not self.validation_mode
+        )
         self.batch_ai_action.setEnabled(
             has_video and self.ai_model is not None and not self.predicting
+            and not validation_busy and not self.validation_mode
         )
         self.batch_stop_action.setEnabled(
             self.batch_thread is not None and self.batch_thread.isRunning()
@@ -3457,12 +4307,18 @@ class AnnotatorWindow(QMainWindow):
         # 是否存在目标由点击时的标注索引扫描决定。
         self.prev_frame_action.setEnabled(has_video and not self.predicting)
         self.next_frame_action.setEnabled(has_video and not self.predicting)
-        self.delete_action.setEnabled(
-            self._selected_box_index() >= 0 and not self.predicting
+        self.playback_action.setEnabled(
+            (has_file and self.is_video and self.total_frames > 1) or has_camera
         )
-        self.clear_current_action.setEnabled(has_file and not self.predicting)
+        self._update_playback_action()
+        self.delete_action.setEnabled(
+            self._selected_box_index() >= 0 and not self.predicting and not self.validation_mode
+        )
+        self.clear_current_action.setEnabled(
+            has_file and not self.predicting and not self.validation_mode
+        )
         self.clear_cache_action.setEnabled(
-            has_file and self.dirty and not self.predicting
+            has_file and self.dirty and not self.predicting and not self.validation_mode
         )
         self.file_list_widget.setEnabled(not self.predicting and bool(self.file_list))
 
@@ -3475,6 +4331,15 @@ class AnnotatorWindow(QMainWindow):
             self.batch_thread.wait()
         if self.predict_thread is not None and self.predict_thread.isRunning():
             self.predict_thread.wait()
+        if self.validation_thread is not None and self.validation_thread.isRunning():
+            self.validation_thread.wait()
+        if (self.is_camera or self.camera_thread is not None) and not self._stop_camera():
+            event.ignore()
+            QMessageBox.warning(
+                self, "摄像头尚未停止",
+                "摄像头采集线程仍在运行，程序暂不退出，以避免销毁仍在运行的线程。"
+            )
+            return
         if self.cap is not None:
             self.cap.release()
             self.cap = None
