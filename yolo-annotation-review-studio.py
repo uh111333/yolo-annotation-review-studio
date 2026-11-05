@@ -68,17 +68,62 @@ ALL_SUFFIXES = VIDEO_SUFFIXES | IMAGE_SUFFIXES
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 
+
+def _directory_contains_label_txt(folder: Path) -> bool:
+    """判断目录树中是否存在 TXT 标签文件；遇到嵌套数据集时不跨入其 images/。"""
+    try:
+        for current, directories, filenames in os.walk(folder, topdown=True, followlinks=False):
+            current_path = Path(current)
+            if (current_path / "images").is_dir():
+                directories[:] = []
+                continue
+            directories[:] = [
+                name for name in directories
+                if name.casefold() not in {
+                    ".git", ".hg", ".svn", "__pycache__", ".venv", "venv",
+                    "node_modules", ".idea", ".vscode",
+                }
+            ]
+            if any(Path(name).suffix.lower() == ".txt" for name in filenames):
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def _annotation_subdirectories(dataset_root: Path) -> list[Path]:
+    """列出数据集根目录中可能存放 YOLO TXT 标签的直接子目录。
+
+    空的 labels/ 可作为数据集结构标识；其他名称的目录需至少包含一个 TXT 文件。
+    这只用于识别数据集，不影响标签查找时的匹配顺序。
+    """
+    result = []
+    try:
+        children = sorted(
+            (item for item in Path(dataset_root).iterdir() if item.is_dir()),
+            key=lambda item: str(item).casefold(),
+        )
+    except OSError:
+        return result
+
+    for child in children:
+        if child.name.casefold() == "images":
+            continue
+        if child.name.casefold() == "labels" or _directory_contains_label_txt(child):
+            result.append(child)
+    return result
+
+
 def resolve_dataset_layout(
     selected_dir: Path,
 ) -> tuple[Path, Path, Path, Path, Path, str]:
-    """根据固定的 YOLO 目录结构确定媒体扫描范围和标签/抽帧目录。
+    """根据 YOLO 数据集结构确定媒体扫描范围和默认标签/抽帧目录。
 
     支持两种明确的数据集状态：
-    1. images/ + labels/，且数据集根目录直接包含视频：按视频复核模式打开。
-       images/ 是程序保存的视频帧图像目录，不作为独立图片导入；视频帧标签
-       从 labels/<视频相对路径>_frame_<六位帧序号>.txt 按需读取。
-    2. 只有 images/ + labels/，没有根目录视频：按图片数据集模式打开 images/，
-       图片 images/xxx.jpg 对应 labels/xxx.txt。
+    1. images/ + 标签目录，且数据集根目录直接包含视频：按视频复核模式打开。
+       images/ 是程序保存的视频帧图像目录，不作为独立图片导入。
+    2. images/ + 标签目录且没有根目录视频：按图片数据集模式打开 images/。
+       图片和视频帧标签均只从当前输出根目录中查找。
 
     其余既有目录形式保持原有处理方式。
     返回：媒体扫描目录、数据集根目录、标签相对目录、视频帧图像相对目录、
@@ -97,9 +142,9 @@ def resolve_dataset_layout(
 
     if selected_dir.name.lower() == "images":
         dataset_root = selected_dir.parent
-        # 即使用户直接选择 images/，只要同级存在 labels/ 和根目录视频，
+        # 即使用户直接选择 images/，只要同级存在标签目录和根目录视频，
         # 也切换到视频复核模式，避免把视频抽帧图像当成独立图片导入。
-        if (dataset_root / "labels").is_dir() and has_direct_video_files(dataset_root):
+        if _annotation_subdirectories(dataset_root) and has_direct_video_files(dataset_root):
             media_dir = dataset_root
             layout_mode = "video_dataset"
         else:
@@ -115,13 +160,13 @@ def resolve_dataset_layout(
         frame_images_relative_dir = Path("images") / selected_dir.name
         source_classes_file = dataset_root / "classes.txt"
         layout_mode = "image_split"
-    elif (selected_dir / "images").is_dir() and (selected_dir / "labels").is_dir():
+    elif (selected_dir / "images").is_dir() and _annotation_subdirectories(selected_dir):
         dataset_root = selected_dir
         labels_relative_dir = Path("labels")
         frame_images_relative_dir = Path("images")
         source_classes_file = dataset_root / "classes.txt"
         if has_direct_video_files(selected_dir):
-            # 视频与 images/、labels/ 同处数据集根目录：只导入视频，
+            # 视频与 images/、标签目录同处数据集根目录：只导入视频，
             # 每次定位视频帧时由 _seek() 读取对应的逐帧标签。
             media_dir = selected_dir
             layout_mode = "video_dataset"
@@ -159,20 +204,20 @@ def resolve_dataset_layout(
 
 
 def discover_yolo_dataset_roots(selected_dir: Path) -> list[Path]:
-    """递归查找同时包含 images/ 与 labels/ 的数据集根目录。
+    """递归查找包含 images/ 与 YOLO TXT 标签目录的数据集根目录。
 
-    扫描时不会进入已识别数据集的 images/、labels/ 目录，避免把数据内容
-    再误识别为嵌套数据集。选择 images/ 或其子目录时，会从所属数据集根目录开始。
+    标签目录可以命名为 labels/ 或任意其他名称。扫描时不会进入已识别数据集的
+    images/ 与标签目录，也不会把嵌套数据集的标签误识别为父数据集的标签。
     """
     selected_dir = Path(selected_dir).resolve()
     if selected_dir.name.lower() == "images":
         dataset_root = selected_dir.parent
-        if (dataset_root / "labels").is_dir():
+        if (dataset_root / "images").is_dir() and _annotation_subdirectories(dataset_root):
             return [dataset_root]
         scan_root = dataset_root
     elif selected_dir.parent.name.lower() == "images":
         dataset_root = selected_dir.parent.parent
-        if (dataset_root / "images").is_dir() and (dataset_root / "labels").is_dir():
+        if (dataset_root / "images").is_dir() and _annotation_subdirectories(dataset_root):
             return [dataset_root]
         scan_root = dataset_root
     else:
@@ -182,16 +227,20 @@ def discover_yolo_dataset_roots(selected_dir: Path) -> list[Path]:
         return []
 
     roots: list[Path] = []
-    for current, dirs, _files in os.walk(scan_root):
+    for current, dirs, _files in os.walk(scan_root, topdown=True, followlinks=False):
         current_path = Path(current)
-        has_images = (current_path / "images").is_dir()
-        has_labels = (current_path / "labels").is_dir()
-        if has_images and has_labels:
-            roots.append(current_path)
-            # images/ 与 labels/ 是数据内容，不是待递归发现的子数据集。
-            dirs[:] = [d for d in dirs if d.lower() not in {"images", "labels"}]
+        if not (current_path / "images").is_dir():
+            continue
 
-    # 同时保留父目录与其非数据子目录中的独立数据集；后续扫描父目录时会排除子数据集范围。
+        annotation_dirs = _annotation_subdirectories(current_path)
+        if not annotation_dirs:
+            continue
+
+        roots.append(current_path)
+        excluded = {"images"}
+        excluded.update(item.name.casefold() for item in annotation_dirs)
+        dirs[:] = [name for name in dirs if name.casefold() not in excluded]
+
     return sorted(set(roots), key=lambda item: (len(item.parts), str(item).casefold()))
 
 BOX_COLORS = [
@@ -724,11 +773,11 @@ class LabelChooserDialog(QDialog):
 
     def accept(self) -> None:
         if not self._classes:
-            QMessageBox.information(self, "提示", "请先添加至少一个类别。")
+            QMessageBox.information(self, "没有类别", "请先添加类别。")
             return
         row = self.list_widget.currentRow()
         if row < 0 or row >= len(self._classes):
-            QMessageBox.information(self, "提示", "请先选择一个类别。")
+            QMessageBox.information(self, "未选择类别", "请先选择一个类别。")
             return
         self._current_index = row
         super().accept()
@@ -783,7 +832,7 @@ class ModelSettingsDialog(QDialog):
         self.conf_spin.setDecimals(2)
         self.conf_spin.setSingleStep(0.05)
         self.conf_spin.setValue(conf)
-        self.conf_spin.setToolTip("置信度低于该阈值的候选检测框将被过滤。")
+        self.conf_spin.setToolTip("低于此置信度的检测结果将被过滤。")
 
         self.iou_spin = QDoubleSpinBox()
         self.iou_spin.setRange(0.01, 0.99)
@@ -791,7 +840,7 @@ class ModelSettingsDialog(QDialog):
         self.iou_spin.setSingleStep(0.05)
         self.iou_spin.setValue(iou)
         self.iou_spin.setToolTip(
-            "用于 YOLO 推理阶段的 NMS；启用多分辨率推理时，也用于跨尺度检测框去重。"
+            "用于推理阶段的 NMS；多分辨率模式下也用于跨尺度去重。"
         )
 
         # 两种分辨率模式互斥：多分辨率模式启用时，单尺度 imgsz 不参与推理。
@@ -800,19 +849,19 @@ class ModelSettingsDialog(QDialog):
         self.imgsz_spin.setSingleStep(32)
         self.imgsz_spin.setValue(imgsz)
         self.imgsz_spin.setToolTip(
-            "仅在未启用多分辨率推理时生效；启用多分辨率后将改用下方尺寸列表。"
+            "单尺度推理尺寸；启用多分辨率后此项停用。"
         )
         self.imgsz_label = QLabel("单尺度输入尺寸（imgsz）")
 
         self.multiscale_check = QCheckBox("启用多分辨率推理与结果融合")
         self.multiscale_check.setChecked(multiscale_enabled)
         self.multiscale_check.setToolTip(
-            "使用列表中的多个输入尺寸分别推理，再通过按类别 NMS 融合检测结果。"
+            "按列表中的多个尺寸分别推理，再融合检测结果。"
         )
         self.multiscale_sizes_edit = QLineEdit(multiscale_sizes)
         self.multiscale_sizes_edit.setPlaceholderText("例如：640, 1280, 1920")
         self.multiscale_sizes_edit.setToolTip(
-            "使用英文逗号分隔；至少填写两个不同的尺寸，取值范围为 320–8192。"
+            "用英文逗号分隔，至少填写两个不同尺寸（320–8192）。"
         )
         self.multiscale_sizes_label = QLabel("多分辨率尺寸列表")
         self.multiscale_check.toggled.connect(self._update_resolution_controls)
@@ -837,7 +886,7 @@ class ModelSettingsDialog(QDialog):
         self.min_box_side_spin.setSuffix(" px")
         self.min_box_side_spin.setValue(min_box_side)
         self.min_box_side_spin.setToolTip(
-            "检测框的宽度或高度任一小于该值时，将过滤该目标。设置为 0 表示不启用过滤。"
+            "过滤宽或高小于此值的检测框；0 表示关闭。"
         )
 
         self.manual_replace_overlap_check = QCheckBox("绘制新框时自动移除重叠标注框")
@@ -848,7 +897,7 @@ class ModelSettingsDialog(QDialog):
         self.manual_replace_overlap_iou_spin.setSingleStep(0.05)
         self.manual_replace_overlap_iou_spin.setValue(manual_replace_overlap_iou)
         self.manual_replace_overlap_iou_spin.setToolTip(
-            "新建人工标注框后，移除与其 IoU 大于或等于该阈值的当前帧旧框；不区分类别或来源。"
+            "新框会移除 IoU 达到此阈值的现有框，不区分类别。"
         )
         self.manual_replace_overlap_iou_spin.setEnabled(manual_replace_overlap_enabled)
         self.manual_replace_overlap_check.toggled.connect(
@@ -860,7 +909,7 @@ class ModelSettingsDialog(QDialog):
         self.frame_step_spin.setSingleStep(1)
         self.frame_step_spin.setValue(frame_step)
         self.frame_step_spin.setToolTip(
-            "批量视频预标注的采样间隔；例如设置为 30 时，从起始帧开始每隔 30 帧处理一次。"
+            "批量推理每隔指定帧数处理一次。"
         )
 
         self.video_total_frames = max(1, int(video_total_frames))
@@ -871,24 +920,20 @@ class ModelSettingsDialog(QDialog):
             min(max(1, int(batch_start_frame)), self.video_total_frames)
         )
         self.batch_start_frame_spin.setToolTip(
-            "批量 AI 预标注的起始帧序号，从 1 开始计数；单帧推理和视频浏览不受此设置影响。"
+            "批量推理起始帧，按 1 开始计数。"
         )
         self.batch_end_frame_spin = QSpinBox()
         self.batch_end_frame_spin.setRange(1, self.video_total_frames)
         self.batch_end_frame_spin.setValue(
             min(max(1, int(batch_end_frame)), self.video_total_frames)
         )
-        self.batch_end_frame_spin.setToolTip(
-            f"批量 AI 预标注的结束帧序号，包含该帧。当前视频共 {self.video_total_frames} 帧。"
-        )
+        self.batch_end_frame_spin.setToolTip("批量推理结束帧，包含该帧。")
 
         self.batch_range_group = QGroupBox("批量 AI 处理范围")
         batch_range_form = QFormLayout(self.batch_range_group)
         batch_range_form.addRow("起始帧（从 1 开始）", self.batch_start_frame_spin)
         batch_range_form.addRow("结束帧（包含）", self.batch_end_frame_spin)
-        self.batch_range_group.setToolTip(
-            f"范围仅对当前视频有效；切换视频后自动重置为第 1 帧至新视频末尾（共 {self.video_total_frames} 帧）。"
-        )
+        self.batch_range_group.setToolTip("仅对当前视频有效；切换视频后重置。")
         self.batch_range_group.setEnabled(self.video_available)
 
         form = QFormLayout()
@@ -927,7 +972,7 @@ class ModelSettingsDialog(QDialog):
             QMessageBox.warning(
                 self,
                 "批量处理范围无效",
-                f"请设置有效范围：起始帧不小于 1，结束帧不早于起始帧，且不超过当前视频末尾（第 {self.video_total_frames} 帧）。",
+                f"起始帧需大于 0，结束帧需不早于起始帧，且不超过视频总帧数（{self.video_total_frames}）。",
             )
             self.batch_end_frame_spin.setFocus()
             return
@@ -1220,7 +1265,6 @@ class AnnotatorWindow(QMainWindow):
         self.file_dataset_keys: dict[Path, str] = {}
         self.dataset_contexts: dict[str, dict] = {}
         self.active_dataset_key: Optional[str] = None
-        self.frame_image_search_dirs: list[Path] = []
         self.output_root: Optional[Path] = None
         self.default_output_root: Optional[Path] = None
         self.labels_relative_dir = Path("labels")
@@ -1228,9 +1272,6 @@ class AnnotatorWindow(QMainWindow):
         self.current_labels_dir: Optional[Path] = None
         self.frame_images_dir: Optional[Path] = None
         self.classes_file: Optional[Path] = None
-        # 读取时按“当前输出目录 -> 原数据集目录 -> 曾用输出目录”的顺序查找，
-        # 这样用户切换保存目录后，仍能读取之前已经存在的标注。
-        self.label_search_dirs: list[Path] = []
 
         self.classes: list[str] = []
         self.last_class_name: Optional[str] = None
@@ -1328,7 +1369,7 @@ class AnnotatorWindow(QMainWindow):
         self.validation_mode_action = QAction("显示置信度", self)
         self.validation_mode_action.setCheckable(True)
         self.validation_mode_action.setToolTip(
-            "使用当前 YOLO 模型验证当前画面；按类别和 IoU 匹配已有标注框，显示对应检测置信度。"
+            "用当前模型验证画面，并显示与现有标注匹配的置信度；不修改标签。"
         )
         self.validation_mode_action.toggled.connect(self._toggle_validation_mode)
         toolbar.addAction(self.validation_mode_action)
@@ -1337,7 +1378,7 @@ class AnnotatorWindow(QMainWindow):
         self.prev_frame_action = QAction("上一标注帧（A）", self)
         self.prev_frame_action.setShortcut("A")
         self.prev_frame_action.setToolTip(
-            "跳转到当前帧之前最近一个包含有效标注框的视频帧；空标签帧会跳过。"
+            "跳转到前一个包含有效标注框的视频帧。"
         )
         self.prev_frame_action.triggered.connect(lambda: self._step_frame(-1))
         toolbar.addAction(self.prev_frame_action)
@@ -1345,7 +1386,7 @@ class AnnotatorWindow(QMainWindow):
         self.next_frame_action = QAction("下一标注帧（D）", self)
         self.next_frame_action.setShortcut("D")
         self.next_frame_action.setToolTip(
-            "跳转到当前帧之后最近一个包含有效标注框的视频帧；空标签帧会跳过。"
+            "跳转到后一个包含有效标注框的视频帧。"
         )
         self.next_frame_action.triggered.connect(lambda: self._step_frame(1))
         toolbar.addAction(self.next_frame_action)
@@ -1366,14 +1407,14 @@ class AnnotatorWindow(QMainWindow):
 
         toolbar.addSeparator()
         self.delete_action = QAction("删除选中框（Backspace）", self)
-        self.delete_action.setToolTip("选中一个标注框后，按 Backspace 删除该框。")
+        self.delete_action.setToolTip("选中标注框后按 Backspace 删除。")
         self.delete_action.triggered.connect(self._delete_selected_box)
         toolbar.addAction(self.delete_action)
 
         toolbar.addSeparator()
         self.clear_current_action = QAction("清空当前画面标注", self)
         self.clear_current_action.setToolTip(
-            "清空当前图片或视频帧的全部标注；保存后会写出空 YOLO 标签文件。"
+            "清空当前画面标注；保存时删除对应标签。"
         )
         self.clear_current_action.triggered.connect(
             self._clear_current_frame_annotations
@@ -1382,7 +1423,7 @@ class AnnotatorWindow(QMainWindow):
 
         self.clear_cache_action = QAction("清空未保存标注缓存", self)
         self.clear_cache_action.setToolTip(
-            "丢弃当前文件所有未保存的标注修改；不删除磁盘上已经保存的标签。"
+            "丢弃当前文件的未保存修改，不影响已保存标签。"
         )
         self.clear_cache_action.triggered.connect(
             self._clear_unsaved_annotation_cache
@@ -1412,9 +1453,9 @@ class AnnotatorWindow(QMainWindow):
         self.model_info_lbl.setWordWrap(True)
         self.model_info_lbl.setToolTip("当前加载的 YOLO 权重文件")
         file_layout.addWidget(self.model_info_lbl)
-        self.output_dir_lbl = QLabel("保存目录：尚未选择")
+        self.output_dir_lbl = QLabel("输出目录：尚未选择")
         self.output_dir_lbl.setWordWrap(True)
-        self.output_dir_lbl.setToolTip("标注文件、视频抽帧图片和 classes.txt 的输出位置")
+        self.output_dir_lbl.setToolTip("标注文件、视频帧缓存图片和类别表的统一输出位置；已有标注也只从此目录读取。")
         file_layout.addWidget(self.output_dir_lbl)
         self.file_filter_label = QLabel("筛选文件：")
         file_layout.addWidget(self.file_filter_label)
@@ -1422,8 +1463,7 @@ class AnnotatorWindow(QMainWindow):
         self.file_filter.setPlaceholderText("输入文件名或相对路径关键词")
         self.file_filter.setClearButtonEnabled(True)
         self.file_filter.setToolTip(
-            "只筛选下方文件列表，不会删除或移动文件。\n"
-            "输入文件名或相对路径中的关键词进行筛选；清空后显示全部文件。"
+            "按文件名或相对路径筛选文件列表。"
         )
         self.file_filter.textChanged.connect(self._filter_file_list)
         self.file_count_lbl = QLabel("尚未加载文件夹")
@@ -1551,7 +1591,7 @@ class AnnotatorWindow(QMainWindow):
                 QMessageBox.warning(
                     self,
                     "缺少依赖",
-                    "当前环境未安装 ultralytics。\n请执行：pip install ultralytics",
+                    "缺少 ultralytics，请先安装：\npip install ultralytics",
                 )
             return False
         if not path.is_file():
@@ -1609,15 +1649,16 @@ class AnnotatorWindow(QMainWindow):
         self.frame_images_dir = self.output_root / self.frame_images_relative_dir
         self.classes_file = self.output_root / "classes.txt"
         if hasattr(self, "output_dir_lbl"):
-            self.output_dir_lbl.setText(f"保存目录：{self.output_root}")
+            self.output_dir_lbl.setText(f"输出目录：{self.output_root}")
             self.output_dir_lbl.setToolTip(str(self.output_root))
 
     def _choose_output_dir(self) -> None:
         """允许用户独立指定标注结果的输出根目录。"""
         if self.media_dir is None or self.default_output_root is None:
-            QMessageBox.information(self, "提示", "请先打开图片或视频文件夹。")
+            QMessageBox.information(self, "尚未打开数据集", "请先打开数据集文件夹。")
             return
-
+        current_file = self.current_file
+        previous_output_root = self.output_root
         last_dir = self.app_settings.value("paths/last_output_dir", "")
         initial_dir = (
             Path(last_dir)
@@ -1629,7 +1670,7 @@ class AnnotatorWindow(QMainWindow):
 
         folder = QFileDialog.getExistingDirectory(
             self,
-            "选择标注结果保存目录",
+            "选择标注输出目录",
             str(initial_dir),
             QFileDialog.ShowDirsOnly,
         )
@@ -1638,6 +1679,7 @@ class AnnotatorWindow(QMainWindow):
 
         output_root = Path(folder).expanduser()
         destination_classes = output_root / "classes.txt"
+        existing_classes = None
         if destination_classes.is_file():
             try:
                 existing_classes = [
@@ -1647,39 +1689,51 @@ class AnnotatorWindow(QMainWindow):
                 ]
             except OSError as exc:
                 QMessageBox.warning(
-                    self, "无法检查类别文件", f"读取目标目录的 classes.txt 失败：\n{exc}"
+                    self, "无法检查类别文件", f"无法读取目标目录的 classes.txt：\n{exc}"
                 )
                 return
-            if not self.classes and existing_classes:
-                # 当前数据集没有提供类别表时，可沿用目标输出目录已有的类别映射。
-                self.classes = existing_classes
-            elif self.classes and existing_classes != self.classes:
+            if self.classes and existing_classes != self.classes:
                 answer = QMessageBox.warning(
                     self,
                     "类别文件不一致",
-                    "所选保存目录中已经存在不同内容的 classes.txt。\n"
-                    "继续保存可能覆盖目标目录原有的类别映射。是否仍然使用该目录？",
+                    "所选输出目录中的 classes.txt 与当前类别表不同。\n继续后将使用当前类别表，可能覆盖目录中原有的类别映射。是否继续？",
                     QMessageBox.Yes | QMessageBox.Cancel,
                     QMessageBox.Cancel,
                 )
                 if answer != QMessageBox.Yes:
                     return
 
-        previous_label_dirs = list(self.label_search_dirs)
-        previous_frame_image_dirs = list(self.frame_image_search_dirs)
+        had_unsaved_changes = self.dirty
+        if not self._confirm_unsaved_changes():
+            return
+
+        output_changed = (
+            previous_output_root is None
+            or Path(previous_output_root).expanduser().resolve() != output_root.resolve()
+        )
         self._configure_output_paths(output_root)
-        if self.current_labels_dir is not None:
-            ordered_dirs = [self.current_labels_dir, *previous_label_dirs]
-            self.label_search_dirs = list(dict.fromkeys(ordered_dirs))
-        if self.frame_images_dir is not None:
-            ordered_frame_dirs = [self.frame_images_dir, *previous_frame_image_dirs]
-            self.frame_image_search_dirs = list(dict.fromkeys(ordered_frame_dirs))
+        if not self.classes and existing_classes:
+            self.classes = existing_classes
+        self._invalidate_label_index_cache()
+        context = self.dataset_contexts.get(self.active_dataset_key or "", {})
+        if output_changed:
+            context.setdefault("resolved_label_paths", {}).clear()
         self._store_active_dataset_context_state()
         self.app_settings.setValue("paths/last_output_dir", str(output_root))
         self.app_settings.sync()
-        self.status_lbl.setText(
-            f"保存目录已设置为：{output_root}。已有标注不会移动，之后保存时将写入新目录。"
-        )
+
+        if (output_changed or had_unsaved_changes) and current_file is not None:
+            # 目录切换或放弃/保存未保存修改后，重新载入，避免旧的内存状态串入目标目录。
+            if self._load_file(current_file):
+                current_status = self.status_lbl.text()
+                self.status_lbl.setText(
+                    f"输出目录已切换，当前媒体已重新载入。{current_status} "
+                    "旧输出目录中的标签不会自动迁移，也不会继续读取。"
+                )
+            else:
+                self.status_lbl.setText("输出目录已切换，但当前媒体载入失败，请重新打开媒体。")
+        else:
+            self.status_lbl.setText("输出目录已设置；已有标签只从此目录读取，后续保存也写入此目录。")
 
     def _open_folder(self) -> None:
         if not self._confirm_unsaved_changes():
@@ -1687,7 +1741,7 @@ class AnnotatorWindow(QMainWindow):
 
         folder = QFileDialog.getExistingDirectory(
             self,
-            "选择数据集文件夹（支持递归识别子数据集）",
+            "选择数据集文件夹",
             str(SCRIPT_DIR),
             QFileDialog.ShowDirsOnly,
         )
@@ -1723,8 +1777,9 @@ class AnnotatorWindow(QMainWindow):
                     "source_classes_file": source_classes_file,
                     "layout_mode": layout_mode,
                     "output_root": resolved_root,
-                    "label_search_dirs": [],
-                    "frame_image_search_dirs": [],
+                    "label_index_cache": {},
+                    "resolved_label_paths": {},
+                    "nested_roots": [],
                     "classes": None,
                     "last_class_name": None,
                 }
@@ -1736,6 +1791,7 @@ class AnnotatorWindow(QMainWindow):
                     root for root in dataset_roots
                     if root != resolved_root and resolved_root in root.parents
                 ]
+                context["nested_roots"] = list(nested_roots)
                 candidate_labels_dir = resolved_root / labels_relative_dir
                 candidate_frame_images_dir = resolved_root / frame_images_relative_dir
 
@@ -1798,8 +1854,9 @@ class AnnotatorWindow(QMainWindow):
                 "source_classes_file": source_classes_file,
                 "layout_mode": layout_mode,
                 "output_root": dataset_root,
-                "label_search_dirs": [],
-                "frame_image_search_dirs": [],
+                "label_index_cache": {},
+                "resolved_label_paths": {},
+                "nested_roots": [],
                 "classes": None,
                 "last_class_name": None,
             }
@@ -1836,7 +1893,7 @@ class AnnotatorWindow(QMainWindow):
                 self,
                 "没有可处理的文件",
                 "所选目录及其子目录中没有找到符合当前数据集结构的图片或视频。\n"
-                "标准数据集需要同时包含 images/ 和 labels/。",
+                "标准数据集应包含 images/；标签只会从当前输出目录中查找。",
             )
             return
 
@@ -1864,19 +1921,18 @@ class AnnotatorWindow(QMainWindow):
         if dataset_count > 1:
             self.status_lbl.setText(
                 f"已递归识别 {dataset_count} 个数据集，共导入 {len(self.file_list)} 个媒体文件。"
-                "切换文件时会自动切换对应的标签、类别与保存目录。"
+                "切换文件时会自动切换对应的类别与输出目录。"
             )
         else:
             context = self.dataset_contexts.get(self.active_dataset_key or "", {})
             if context.get("layout_mode") == "video_dataset":
                 self.status_lbl.setText(
-                    "已识别为视频标注数据集：images/ 中的抽帧缓存不单独导入；"
-                    "视频帧标注按视频名和帧序号从 labels/ 自动读取。"
+                    "已打开视频数据集；抽帧缓存不会加入文件列表。标签从当前输出目录读取和保存。"
                 )
         self._sync_ui_state()
 
     def _store_active_dataset_context_state(self) -> None:
-        """保存当前数据集的输出目录、标签搜索路径和类别状态。"""
+        """保存当前数据集的输出目录和类别状态。"""
         if not self.active_dataset_key:
             return
         context = self.dataset_contexts.get(self.active_dataset_key)
@@ -1884,8 +1940,6 @@ class AnnotatorWindow(QMainWindow):
             return
         if self.output_root is not None:
             context["output_root"] = self.output_root
-        context["label_search_dirs"] = list(self.label_search_dirs)
-        context["frame_image_search_dirs"] = list(self.frame_image_search_dirs)
         context["classes"] = list(self.classes)
         context["last_class_name"] = self.last_class_name
 
@@ -1908,12 +1962,7 @@ class AnnotatorWindow(QMainWindow):
         output_root = Path(context.get("output_root") or context["dataset_root"])
         self._configure_output_paths(output_root)
 
-        label_dirs = list(context.get("label_search_dirs") or [])
-        if self.current_labels_dir is not None:
-            self.label_search_dirs = list(dict.fromkeys([self.current_labels_dir, *label_dirs]))
-        frame_dirs = list(context.get("frame_image_search_dirs") or [])
-        if self.frame_images_dir is not None:
-            self.frame_image_search_dirs = list(dict.fromkeys([self.frame_images_dir, *frame_dirs]))
+        context.setdefault("label_index_cache", {}).clear()
 
         cached_classes = context.get("classes")
         if cached_classes is not None:
@@ -1939,16 +1988,40 @@ class AnnotatorWindow(QMainWindow):
 
     def _relative_media_path(self, path: Path) -> Path:
         if self.media_dir is None:
-            return Path(path.name)
-        try:
-            return path.relative_to(self.media_dir)
-        except ValueError:
-            return Path(path.name)
+            raise RuntimeError("当前没有有效的媒体目录上下文。")
+        return path.relative_to(self.media_dir)
 
-    def _image_label_path(self, path: Path) -> Path:
-        assert self.current_labels_dir is not None
+    def _label_lookup_path(self, media_relative_path: Path) -> Path:
+        """将图片分组目录纳入匹配键；标准 labels/ 布局不增加额外前缀。"""
+        label_parts = self.labels_relative_dir.parts
+        split_parts = label_parts[1:] if label_parts and label_parts[0].casefold() == "labels" else ()
+        return Path(*split_parts, *media_relative_path.parts)
+
+    def _clear_media_label_path_cache(self, path: Path) -> None:
+        """媒体重新载入时清除该媒体的解析结果，允许用户修复后重新匹配。"""
+        context = self.dataset_contexts.get(self.active_dataset_key or "", {})
+        resolved_paths = context.setdefault("resolved_label_paths", {})
         relative = self._relative_media_path(path)
-        return (self.current_labels_dir / relative).with_suffix(".txt")
+        if path.suffix.lower() in VIDEO_SUFFIXES:
+            prefix_path = relative.parent / f"{relative.stem}_frame_"
+            prefix = self._label_path_key(self._label_lookup_path(prefix_path))
+            keys = [key for key in resolved_paths if key.startswith(prefix)]
+        else:
+            key = self._label_path_key(
+                self._label_lookup_path(relative.with_suffix(".txt"))
+            )
+            keys = [key]
+
+        for key in keys:
+            resolved_paths.pop(key, None)
+
+    def _image_label_path(self, path: Path, search_if_missing: bool = True) -> Path:
+        assert self.current_labels_dir is not None
+        relative = self._relative_media_path(path).with_suffix(".txt")
+        return self._label_path(
+            self._label_lookup_path(relative), self.current_labels_dir / relative,
+            search_if_missing=search_if_missing,
+        )
 
     def _video_frame_stem(self, frame_index: int) -> Path:
         """返回相对标签目录的帧文件名（不带扩展名）。"""
@@ -1962,42 +2035,143 @@ class AnnotatorWindow(QMainWindow):
             ".jpg"
         )
 
-    def _video_frame_label_path(self, frame_index: int) -> Path:
+    def _video_frame_label_path(
+        self, frame_index: int, search_if_missing: bool = True
+    ) -> Path:
         assert self.current_labels_dir is not None
-        return self.current_labels_dir / self._video_frame_stem(frame_index).with_suffix(
-            ".txt"
+        relative = self._video_frame_stem(frame_index).with_suffix(".txt")
+        return self._label_path(
+            self._label_lookup_path(relative), self.current_labels_dir / relative,
+            search_if_missing=search_if_missing,
         )
 
-    def _find_existing_label(self, relative_label_path: Path) -> Optional[Path]:
-        """按当前输出目录优先、历史目录其次的顺序查找已有标签。"""
-        for label_dir in self.label_search_dirs:
-            candidate = label_dir / relative_label_path
-            if candidate.is_file():
-                return candidate
-        # 容错：若目录列表尚未初始化，至少检查当前输出目录。
-        if self.current_labels_dir is not None:
-            candidate = self.current_labels_dir / relative_label_path
-            if candidate.is_file():
-                return candidate
+    def _label_path(
+        self, relative_label_path: Path, default_path: Path, *, search_if_missing: bool
+    ) -> Path:
+        """读取或首次解析标签路径；保存时关闭查找，只使用已缓存结果。"""
+        context = self.dataset_contexts.get(self.active_dataset_key or "", {})
+        resolved_paths = context.setdefault("resolved_label_paths", {})
+        key = self._label_path_key(relative_label_path)
+        if key in resolved_paths:
+            return resolved_paths[key] or default_path
+
+        if not search_if_missing:
+            raise RuntimeError(f"标签路径尚未初始化：{relative_label_path}。请重新打开当前媒体。")
+        existing_path = self._find_indexed_label(relative_label_path)
+        resolved_paths[key] = existing_path
+        return existing_path or default_path
+
+    @staticmethod
+    def _label_path_key(path: Path) -> str:
+        """生成跨平台、不区分大小写的相对路径索引键。"""
+        return path.as_posix().replace("\\", "/").casefold()
+
+    def _label_index(self) -> dict:
+        """只索引当前输出目录中的 TXT；每个匹配键只保留排序后的第一个文件。"""
+        if self.output_root is None:
+            return {"by_relative": {}, "by_name": {}, "all_paths": [], "video_frame_indices": {}}
+
+        output_root = Path(self.output_root).expanduser().resolve()
+        context = self.dataset_contexts.get(self.active_dataset_key or "", {})
+        cache = context.setdefault("label_index_cache", {})
+        cache_key = str(output_root)
+        if cache_key in cache:
+            return cache[cache_key]
+
+        ignored_names = {
+            ".git", ".hg", ".svn", "__pycache__", ".venv", "venv",
+            "node_modules", ".idea", ".vscode",
+        }
+        excluded_roots = []
+        for directory in (self.media_dir, self.frame_images_dir):
+            if directory is None:
+                continue
+            resolved = Path(directory).resolve()
+            if resolved != output_root and output_root in resolved.parents:
+                excluded_roots.append(resolved)
+
+        # 输出目录若是多个数据集的共同父目录，不把其他数据集的标签混入索引。
+        for key, other_context in self.dataset_contexts.items():
+            if key == self.active_dataset_key:
+                continue
+            other_root = Path(other_context["dataset_root"]).resolve()
+            if other_root != output_root and output_root in other_root.parents:
+                excluded_roots.append(other_root)
+        excluded_roots.extend(Path(item).resolve() for item in context.get("nested_roots", []))
+
+        by_relative: dict[str, Path] = {}
+        by_name: dict[str, Path] = {}
+        all_paths: list[Path] = []
+        if output_root.is_dir():
+            for current, directories, filenames in os.walk(
+                output_root, topdown=True, followlinks=False
+            ):
+                current_path = Path(current)
+                current_resolved = current_path.resolve()
+                if any(
+                    current_resolved == excluded or excluded in current_resolved.parents
+                    for excluded in excluded_roots
+                ):
+                    directories[:] = []
+                    continue
+
+                directories[:] = sorted(
+                    [
+                        name for name in directories
+                        if name.casefold() not in ignored_names
+                        and (current_path / name).resolve() not in excluded_roots
+                    ],
+                    key=str.casefold,
+                )
+                for filename in sorted(filenames, key=str.casefold):
+                    if Path(filename).suffix.casefold() != ".txt" or filename.casefold() == "classes.txt":
+                        continue
+                    candidate = current_path / filename
+                    all_paths.append(candidate)
+                    by_name.setdefault(candidate.name.casefold(), candidate)
+
+                    # 为输出目录内不同名称的标签子目录建立相对路径别名。
+                    relative_parts = candidate.relative_to(output_root).parts
+                    for offset in range(len(relative_parts)):
+                        key = self._label_path_key(Path(*relative_parts[offset:]))
+                        by_relative.setdefault(key, candidate)
+
+        index = {
+            "by_relative": by_relative,
+            "by_name": by_name,
+            "all_paths": all_paths,
+            "video_frame_indices": {},
+        }
+        cache[cache_key] = index
+        return index
+
+    def _find_indexed_label(self, relative_label_path: Path) -> Optional[Path]:
+        """按相对路径优先、文件名回退的规则，返回第一个匹配文件。"""
+        index = self._label_index()
+        candidate = index["by_relative"].get(self._label_path_key(relative_label_path))
+        if candidate is not None and candidate.is_file():
+            return candidate
+
+        # 文件名回退仅限输出根目录下的平铺标签，不跨媒体子目录误配。
+        if self.output_root is None:
+            return None
+        output_root = Path(self.output_root).expanduser().resolve()
+        candidate = index["by_name"].get(relative_label_path.name.casefold())
+        if (
+            candidate is not None
+            and len(candidate.relative_to(output_root).parts) <= 2
+            and candidate.is_file()
+        ):
+            return candidate
         return None
 
     def _existing_image_label_path(self, path: Path) -> Optional[Path]:
-        """查找图片对应的 YOLO 标签，优先采用数据集 labels 目录映射。"""
-        relative = self._relative_media_path(path).with_suffix(".txt")
-        label_path = self._find_existing_label(relative)
-        if label_path is not None:
-            return label_path
-
-        # 兼容图片与同名 TXT 标签直接放在同一目录的简单数据集结构。
-        adjacent_label = path.with_suffix(".txt")
-        if adjacent_label.is_file():
-            return adjacent_label
-        return None
+        label_path = self._image_label_path(path)
+        return label_path if label_path.is_file() else None
 
     def _existing_video_frame_label_path(self, frame_index: int) -> Optional[Path]:
-        return self._find_existing_label(
-            self._video_frame_stem(frame_index).with_suffix(".txt")
-        )
+        label_path = self._video_frame_label_path(frame_index)
+        return label_path if label_path.is_file() else None
 
     def _update_video_frame_label_status(
         self,
@@ -2017,7 +2191,6 @@ class AnnotatorWindow(QMainWindow):
             f"当前视频共有 {len(marked_frames)} 个带标注框的帧。"
             if marked_frames is not None else ""
         )
-
         if loaded_from_disk and label_path is not None:
             message = (
                 f"已载入现有标注：{self.current_file.name} / {frame_text}，"
@@ -2042,7 +2215,7 @@ class AnnotatorWindow(QMainWindow):
         else:
             message = (
                 f"已打开视频：{self.current_file.name} / {frame_text}；"
-                "未找到当前帧对应的 YOLO 标签文件。"
+                "当前输出目录中没有当前帧对应的标签文件。"
             )
 
         if summary_text:
@@ -2051,6 +2224,7 @@ class AnnotatorWindow(QMainWindow):
 
     def _load_file(self, path: Path) -> bool:
         self._activate_file_dataset_context(path)
+        self._clear_media_label_path_cache(path)
         self._stop_playback()
         if self.cap is not None:
             self.cap.release()
@@ -2156,7 +2330,7 @@ class AnnotatorWindow(QMainWindow):
                     f"已载入已有标注：{path.name}，{loaded_count} 个标注框。可直接选择并修改。"
                 )
             else:
-                self.status_lbl.setText(f"已打开图片：{path.name}；未找到对应的 YOLO 标签文件。")
+                self.status_lbl.setText(f"已打开图片：{path.name}；当前输出目录中没有对应的标签文件。")
 
         self._set_file_list_current()
         self._sync_ui_state()
@@ -2317,54 +2491,35 @@ class AnnotatorWindow(QMainWindow):
         return False
 
     def _marked_video_frame_indices(self) -> list[int]:
-        """返回当前视频所有包含标注框的帧序号（从 0 开始）。
-
-        内存缓存优先于磁盘标签：缓存中存在的帧即使被清空，也不会被旧磁盘
-        标签重新计入。磁盘标签按 label_search_dirs 的优先顺序查找。
-        """
+        """返回当前视频所有包含有效标注框的帧序号（从 0 开始）。"""
         if not self.is_video or self.current_file is None:
             return []
 
-        marked: set[int] = set()
+        # 内存中的空列表代表用户显式清空该帧，必须覆盖磁盘上的旧标签。
+        marked = {
+            frame_index
+            for frame_index, boxes in self.annotations.items()
+            if 0 <= frame_index < self.total_frames and boxes
+        }
 
-        # 当前会话缓存可能包含尚未保存的 AI / 人工标注，也可能显式清空了旧框。
-        for frame_index, boxes in self.annotations.items():
-            if 0 <= frame_index < self.total_frames and boxes:
-                marked.add(frame_index)
-
-        # 收集当前视频对应的所有标签文件编号。只扫描当前视频所在的相对目录，
-        # 避免把同一数据集其他视频的帧标签混入导航列表。
+        index = self._label_index()
+        context = self.dataset_contexts.get(self.active_dataset_key or "", {})
         relative_video = self._relative_media_path(self.current_file)
         prefix = f"{relative_video.stem}_frame_"
-        candidate_indices: set[int] = set()
-        label_dirs = self.label_search_dirs or (
-            [self.current_labels_dir] if self.current_labels_dir is not None else []
-        )
-        for label_root in label_dirs:
-            if label_root is None:
-                continue
-            label_folder = label_root / relative_video.parent
-            if not label_folder.is_dir():
-                continue
-            try:
-                entries = label_folder.iterdir()
-                for path in entries:
-                    if path.suffix.lower() != ".txt" or not path.stem.startswith(prefix):
-                        continue
-                    frame_text = path.stem[len(prefix):]
-                    if not frame_text.isdigit():
-                        continue
-                    frame_index = int(frame_text)
-                    if 0 <= frame_index < self.total_frames:
-                        candidate_indices.add(frame_index)
-            except OSError:
-                continue
+        prefix_key = prefix.casefold()
+        candidate_indices = index["video_frame_indices"].get(prefix_key)
+        if candidate_indices is None:
+            candidate_indices = set()
+            for path in index["all_paths"]:
+                stem = path.stem
+                if stem.casefold().startswith(prefix_key):
+                    frame_text = stem[len(prefix):]
+                    if frame_text.isdigit():
+                        candidate_indices.add(int(frame_text))
+            index["video_frame_indices"][prefix_key] = candidate_indices
 
-        # 对每个候选编号重新按目录优先级解析一次，确保当前输出目录中的空标签
-        # 能覆盖旧目录里的非空标签。
         for frame_index in candidate_indices:
-            if frame_index in self.annotations:
-                # 内存缓存对该帧拥有最终决定权（包含显式空列表）。
+            if not 0 <= frame_index < self.total_frames or frame_index in self.annotations:
                 continue
             label_path = self._existing_video_frame_label_path(frame_index)
             if label_path is not None and self._label_file_has_boxes(label_path):
@@ -2771,7 +2926,7 @@ class AnnotatorWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "模型不可用",
-                "尚未加载 YOLO 模型。\n请安装 ultralytics 并点击顶部“加载模型”选择 .pt 权重。",
+                "请先加载 YOLO 权重。",
             )
             return
         if self.frame is None or self.current_file is None:
@@ -2890,16 +3045,16 @@ class AnnotatorWindow(QMainWindow):
 
     def _run_batch_ai_predict(self) -> None:
         if self.ai_model is None:
-            QMessageBox.warning(self, "模型不可用", "请先点击顶部“加载模型”选择 YOLO 权重。")
+            QMessageBox.warning(self, "模型不可用", "请先加载 YOLO 权重。")
             return
         if not self.is_video or self.current_file is None:
-            QMessageBox.information(self, "需要视频文件", "请先在文件列表中选择一个视频文件。")
+            QMessageBox.information(self, "需要视频文件", "请先选择视频文件。")
             return
         if self.predicting:
             self.status_lbl.setText("当前已有 AI 推理任务正在执行。")
             return
         if self.total_frames <= 0:
-            QMessageBox.warning(self, "无法批量标注", "当前视频无法获取有效帧数。")
+            QMessageBox.warning(self, "无法批量标注", "无法读取视频帧数，暂不能批量处理。")
             return
 
         step = max(1, int(self.frame_step))
@@ -2911,19 +3066,11 @@ class AnnotatorWindow(QMainWindow):
             QMessageBox.warning(self, "批量处理范围无效", str(exc))
             return
         sample_count = (end_frame - start_frame) // step + 1
-        first_samples = ", ".join(
-            str(start_frame + i * step) for i in range(min(5, sample_count))
-        )
-        suffix = "……" if sample_count > 5 else ""
         answer = QMessageBox.question(
             self,
             "批量 AI 预标注",
-            f"将处理第 {start_frame}–{end_frame} 帧（包含起止帧），按 {step} 帧的采样间隔执行，预计推理 {sample_count} 帧。\n"
-            f"采样帧序号（从 1 开始）：{first_samples}{suffix}\n\n"
-            f"输入尺寸：{', '.join(map(str, self._active_imgsz_values()))}\n"
-            f"多分辨率推理：{'启用' if self.multiscale_enabled else '未启用'}\n"
-            f"最小目标边长：{self.inference_min_box_side}px（0 表示关闭）\n"
-            f"检测结果将写入当前文件的未保存标注缓存，请复核后再保存。是否开始？",
+            f"将处理第 {start_frame}–{end_frame} 帧，每隔 {step} 帧采样，共推理 {sample_count} 帧。\n"
+            "结果先写入未保存缓存；复核后请点击“保存标注”。是否开始？",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.Yes,
         )
@@ -2999,7 +3146,7 @@ class AnnotatorWindow(QMainWindow):
             state_text = "已停止" if stopped else "完成"
         result_text = (
             f"批量 AI 预标注{state_text}：处理 {sampled} 个采样帧，"
-            f"新增 {self.batch_added_count} 个检测框，失败 {failed} 帧，"
+            f"新增 {self.batch_added_count} 个检测框，失败 {self.batch_error_count} 帧，"
             f"因类别名称不匹配跳过 {self.batch_skipped_count} 个检测框。"
         )
         if self.dirty:
@@ -3044,9 +3191,8 @@ class AnnotatorWindow(QMainWindow):
         answer = QMessageBox.question(
             self,
             "清空当前画面标注",
-            f"确定清空 {frame_description} 中的全部 {box_count} 个标注框吗？\n\n"
-            "点击“保存标注”后，如果该画面没有有效标注框，将删除对应的 YOLO TXT 文件；"
-            "如果是视频帧，还会删除 images/ 中导出的对应帧图片。原始照片和视频不会删除。",
+            f"确定清空当前画面的 {box_count} 个标注框？\n"
+            "保存后会删除对应标签；视频帧还会删除抽帧缓存图。原始照片和视频不会删除。",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
@@ -3059,7 +3205,7 @@ class AnnotatorWindow(QMainWindow):
         self._refresh_frame()
         self._sync_ui_state()
         self.status_lbl.setText(
-            f"已清空 {frame_description} 的全部标注。点击“保存标注”后将删除对应空标签文件。"
+            f"已清空 {frame_description} 的标注；保存后将删除对应标签。"
         )
 
     def _clear_unsaved_annotation_cache(self) -> None:
@@ -3075,10 +3221,8 @@ class AnnotatorWindow(QMainWindow):
         answer = QMessageBox.question(
             self,
             "清空未保存标注缓存",
-            f"当前文件的内存缓存中有 {cached_frame_count} 帧、{cached_box_count} 个标注框。\n\n"
-            "继续后会丢弃当前文件全部未保存的修改，而不是只清除当前帧。"
-            "磁盘上已经保存的标签文件不会删除；当前画面会重新读取磁盘上的已有标签，"
-            "视频其他帧在再次访问时按需读取。\n\n是否继续？",
+            f"将丢弃当前文件全部未保存修改（{cached_frame_count} 帧、{cached_box_count} 个框）。\n"
+            "磁盘上已保存的标签不会删除。是否继续？",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
@@ -3126,38 +3270,34 @@ class AnnotatorWindow(QMainWindow):
                 continue
         return False
 
-    def _delete_existing_label_files(self, relative_label_path: Path) -> int:
-        """删除当前数据集已知搜索目录中的同一标签文件，避免旧标签再次被读回。"""
-        label_dirs = list(self.label_search_dirs)
-        if self.current_labels_dir is not None:
-            label_dirs.insert(0, self.current_labels_dir)
-        removed = 0
-        for label_dir in dict.fromkeys(label_dirs):
-            candidate = label_dir / relative_label_path
-            try:
-                if candidate.is_file():
-                    candidate.unlink()
-                    removed += 1
-            except OSError as exc:
-                raise OSError(f"无法删除空标签文件：{candidate}（{exc}）") from exc
-        return removed
+    def _delete_label_file(self, label_path: Path) -> int:
+        """删除已解析的标签路径，不重新搜索候选文件。"""
+        if not label_path.is_file():
+            return 0
+        try:
+            label_path.unlink()
+            return 1
+        except OSError as exc:
+            raise OSError(f"无法删除空标签文件：{label_path}（{exc}）") from exc
+
+    def _invalidate_label_index_cache(self) -> None:
+        """保存操作修改磁盘标签后，清除当前数据集的索引缓存。"""
+        context = self.dataset_contexts.get(self.active_dataset_key or "")
+        if context is not None:
+            context.setdefault("label_index_cache", {}).clear()
 
     def _delete_video_frame_images(self, frame_index: int) -> int:
-        """删除当前视频帧在所有已知输出目录中的导出图片。"""
-        relative_image_path = self._video_frame_stem(frame_index).with_suffix(".jpg")
-        image_dirs = list(self.frame_image_search_dirs)
-        if self.frame_images_dir is not None:
-            image_dirs.insert(0, self.frame_images_dir)
-        removed = 0
-        for image_dir in dict.fromkeys(image_dirs):
-            candidate = image_dir / relative_image_path
-            try:
-                if candidate.is_file():
-                    candidate.unlink()
-                    removed += 1
-            except OSError as exc:
-                raise OSError(f"无法删除视频帧缓存图片：{candidate}（{exc}）") from exc
-        return removed
+        """删除当前输出目录中对应的视频帧缓存图片。"""
+        if self.frame_images_dir is None:
+            return 0
+        candidate = self._video_frame_image_path(frame_index)
+        try:
+            if candidate.is_file():
+                candidate.unlink()
+                return 1
+        except OSError as exc:
+            raise OSError(f"无法删除视频帧缓存图片：{candidate}（{exc}）") from exc
+        return 0
 
     def _save(self) -> bool:
         if self.current_file is None or self.current_labels_dir is None:
@@ -3166,9 +3306,7 @@ class AnnotatorWindow(QMainWindow):
             QMessageBox.warning(self, "无法保存", "当前没有有效画面。")
             return False
         if not self.annotations:
-            self.status_lbl.setText(
-                "当前没有标注缓存可保存。若要将当前画面保存为空标签，请先使用“清空当前画面标注”。"
-            )
+            self.status_lbl.setText("没有待保存的标注。清空画面后可保存为空标签。")
             return False
         if not self.is_video and 0 not in self.annotations:
             self.status_lbl.setText("当前图片没有标注缓存可保存。")
@@ -3180,10 +3318,17 @@ class AnnotatorWindow(QMainWindow):
                     raise RuntimeError("视频对象已关闭，请重新打开视频。")
 
                 restore_index = self.frame_idx
+                frame_indices = sorted(self.annotations)
+                # 复用载入时解析出的标签路径，确保读取、保存和删除作用于同一文件。
+                label_targets = {
+                    frame_index: self._video_frame_label_path(frame_index, search_if_missing=False)
+                    for frame_index in frame_indices
+                }
+
                 saved_frames = 0
                 deleted_labels = 0
                 deleted_frame_images = 0
-                for frame_index in sorted(self.annotations):
+                for frame_index in frame_indices:
                     self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
                     ok, frame = self.cap.read()
                     if not ok or frame is None:
@@ -3191,33 +3336,31 @@ class AnnotatorWindow(QMainWindow):
 
                     height, width = frame.shape[:2]
                     boxes = self.annotations[frame_index]
-                    relative_label_path = self._video_frame_stem(frame_index).with_suffix(".txt")
+                    label_path = label_targets[frame_index]
                     if self._has_valid_boxes_for_save(boxes, width, height):
                         image_path = self._video_frame_image_path(frame_index)
-                        label_path = self._video_frame_label_path(frame_index)
                         if not save_image_unicode(image_path, frame):
                             raise OSError(f"视频帧图片保存失败：{image_path}")
                         write_yolo_label(label_path, boxes, width, height)
                         saved_frames += 1
                     else:
-                        deleted_labels += self._delete_existing_label_files(relative_label_path)
+                        deleted_labels += self._delete_label_file(label_path)
                         deleted_frame_images += self._delete_video_frame_images(frame_index)
 
                 self._seek(restore_index)
                 saved_info = (
-                    f"已保存 {saved_frames} 个有标注的视频帧；删除 {deleted_labels} 个空标签文件，"
+                    f"已保存 {saved_frames} 个带标注的视频帧；删除 {deleted_labels} 个空标签文件，"
                     f"删除 {deleted_frame_images} 张对应的帧缓存图片。"
                 )
             else:
                 boxes = self.annotations[0]
-                relative_label_path = self._relative_media_path(self.current_file).with_suffix(".txt")
+                label_path = self._image_label_path(self.current_file, search_if_missing=False)
                 if self._has_valid_boxes_for_save(boxes, self.image_w, self.image_h):
-                    label_path = self._image_label_path(self.current_file)
                     write_yolo_label(label_path, boxes, self.image_w, self.image_h)
                     saved_info = f"已保存：{label_path}"
                 else:
-                    deleted_labels = self._delete_existing_label_files(relative_label_path)
-                    saved_info = f"当前图片没有有效标注框，已删除 {deleted_labels} 个对应标签文件；原始图片保留。"
+                    deleted_labels = self._delete_label_file(label_path)
+                    saved_info = f"当前图片没有有效标注框，已删除 {deleted_labels} 个标签文件；原始图片未更改。"
 
             if self.classes and self.classes_file is not None:
                 self.classes_file.parent.mkdir(parents=True, exist_ok=True)
@@ -3237,6 +3380,8 @@ class AnnotatorWindow(QMainWindow):
             )
             self.status_lbl.setText(f"保存失败：{exc}")
             return False
+        finally:
+            self._invalidate_label_index_cache()
 
     # ---------- 窗口状态与退出 ----------
 
@@ -3258,7 +3403,7 @@ class AnnotatorWindow(QMainWindow):
 
         box = QMessageBox(self)
         box.setWindowTitle("存在未保存的标注")
-        box.setText("当前文件有未保存的修改。是否先保存？")
+        box.setText("当前有未保存的修改。是否保存？")
         save_button = box.addButton("保存", QMessageBox.AcceptRole)
         discard_button = box.addButton("放弃修改", QMessageBox.DestructiveRole)
         cancel_button = box.addButton("取消", QMessageBox.RejectRole)
