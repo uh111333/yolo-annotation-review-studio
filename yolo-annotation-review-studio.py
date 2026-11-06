@@ -47,6 +47,7 @@ from PyQt5.QtWidgets import (
     QTreeWidgetItem,
     QTextEdit,
     QToolBar,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -888,10 +889,7 @@ class ModelSettingsDialog(QDialog):
             self.camera_device_combo.addItem(label, device_index)
         selected_camera_row = self.camera_device_combo.findData(int(camera_device_index))
         self.camera_device_combo.setCurrentIndex(max(0, selected_camera_row))
-        self.camera_device_combo.setToolTip(
-            "通过 OpenCV 设备编号选择本机摄像头。0 通常是默认摄像头，其他编号对应其他设备；"
-            "点击应用后，若摄像头已打开会立即切换到新设备。"
-        )
+        self.camera_device_combo.setToolTip("选择摄像头设备。")
         camera_form = QFormLayout()
         camera_form.addRow("摄像头设备", self.camera_device_combo)
         self.camera_group = QGroupBox("摄像头")
@@ -900,9 +898,7 @@ class ModelSettingsDialog(QDialog):
         self.secondary_model_edit = QLineEdit(str(secondary_model_path or ""))
         self.secondary_model_edit.setClearButtonEnabled(True)
         self.secondary_model_edit.setPlaceholderText("可选：选择第二个 YOLO .pt 权重文件")
-        self.secondary_model_edit.setToolTip(
-            "副模型仅参与实时验证，不影响单帧或批量 AI 预标注。清空此项即可关闭双模型验证。"
-        )
+        self.secondary_model_edit.setToolTip("选择用于实时验证的副模型。")
         secondary_browse_button = QPushButton("浏览…")
         secondary_browse_button.clicked.connect(self._browse_secondary_model)
         secondary_path_row = QWidget()
@@ -917,7 +913,7 @@ class ModelSettingsDialog(QDialog):
         mode_row = self.validation_model_mode_combo.findData(str(validation_model_mode))
         self.validation_model_mode_combo.setCurrentIndex(max(0, mode_row))
         self.validation_model_mode_combo.setToolTip(
-            "全量：显示两个模型的全部检测框。叠加：主模型全部显示，副模型仅显示与主模型检测框达到阈值的结果。"
+            "全量显示两个模型的检测框；叠加仅显示与主模型重叠的副模型检测框。"
         )
 
         self.validation_overlap_iou_spin = QDoubleSpinBox()
@@ -925,9 +921,7 @@ class ModelSettingsDialog(QDialog):
         self.validation_overlap_iou_spin.setDecimals(2)
         self.validation_overlap_iou_spin.setSingleStep(0.05)
         self.validation_overlap_iou_spin.setValue(validation_overlap_iou)
-        self.validation_overlap_iou_spin.setToolTip(
-            "副模型检测框与任意主模型检测框的几何 IoU 达到此值时才显示；不比较类别。"
-        )
+        self.validation_overlap_iou_spin.setToolTip("副模型框与主模型框的 IoU 达到此值时显示。")
 
         dual_model_form = QFormLayout()
         dual_model_form.addRow("副模型权重", secondary_path_row)
@@ -1521,6 +1515,7 @@ class AnnotatorWindow(QMainWindow):
         self.batch_error_count = 0
         self.batch_skipped_count = 0
         self._batch_stopped_by_user = False
+        self._batch_stop_requested = False
         self._updating_file_list = False
 
         self._build_ui()
@@ -1593,10 +1588,8 @@ class AnnotatorWindow(QMainWindow):
         self.open_action.triggered.connect(self._open_folder)
         toolbar.addAction(self.open_action)
 
-        self.open_camera_action = QAction("打开摄像头", self)
-        self.open_camera_action.setToolTip(
-            f"打开设置中选择的本机摄像头（设备 {self.camera_device_index}）；无需先打开数据集。"
-        )
+        self.open_camera_action = QAction("摄像头", self)
+        self.open_camera_action.setToolTip("打开摄像头。")
         self.open_camera_action.triggered.connect(self._open_camera)
         toolbar.addAction(self.open_camera_action)
 
@@ -1604,7 +1597,7 @@ class AnnotatorWindow(QMainWindow):
         self.output_dir_action.triggered.connect(self._choose_output_dir)
         toolbar.addAction(self.output_dir_action)
 
-        self.save_action = QAction("保存标注（S）", self)
+        self.save_action = QAction("保存标注", self)
         self.save_action.setShortcut("S")
         self.save_action.triggered.connect(self._save)
         toolbar.addAction(self.save_action)
@@ -1615,38 +1608,32 @@ class AnnotatorWindow(QMainWindow):
         toolbar.addAction(self.model_action)
 
         self.model_settings_action = QAction("设置", self)
-        self.model_settings_action.setToolTip("设置摄像头设备、AI 推理参数、实时验证双模型和标注行为。")
+        self.model_settings_action.setToolTip("推理与标注设置。")
         self.model_settings_action.triggered.connect(self._show_model_settings)
         toolbar.addAction(self.model_settings_action)
 
         self.validation_mode_action = QAction("实时验证", self)
         self.validation_mode_action.setCheckable(True)
-        self.validation_mode_action.setToolTip(
-            "对视频或摄像头最新画面运行 YOLO 推理并独立显示检测框与置信度；"
-            "可在设置中选用副模型，不显示、不修改已有标注。"
-        )
+        self.validation_mode_action.setToolTip("显示视频或摄像头画面的模型检测结果。")
         self.validation_mode_action.toggled.connect(self._toggle_validation_mode)
         toolbar.addAction(self.validation_mode_action)
 
         toolbar.addSeparator()
-        self.prev_frame_action = QAction("上一标注帧（A）", self)
+        self.prev_frame_action = QAction("上一标注帧", self)
         self.prev_frame_action.setShortcut("A")
-        self.prev_frame_action.setToolTip(
-            "跳转到前一个包含有效标注框的视频帧。"
-        )
+        self.prev_frame_action.setToolTip("跳转到上一条有标注的帧。")
         self.prev_frame_action.triggered.connect(lambda: self._step_frame(-1))
         toolbar.addAction(self.prev_frame_action)
 
         self.playback_action = QAction("播放", self)
-        self.playback_action.setToolTip("连续播放当前视频；到达最后一帧时自动停止。")
+        self.playback_action.setShortcut("Space")
+        self.playback_action.setToolTip("播放或暂停。")
         self.playback_action.triggered.connect(self._toggle_playback)
         toolbar.addAction(self.playback_action)
 
-        self.next_frame_action = QAction("下一标注帧（D）", self)
+        self.next_frame_action = QAction("下一标注帧", self)
         self.next_frame_action.setShortcut("D")
-        self.next_frame_action.setToolTip(
-            "跳转到后一个包含有效标注框的视频帧。"
-        )
+        self.next_frame_action.setToolTip("跳转到下一条有标注的帧。")
         self.next_frame_action.triggered.connect(lambda: self._step_frame(1))
         toolbar.addAction(self.next_frame_action)
 
@@ -1655,35 +1642,26 @@ class AnnotatorWindow(QMainWindow):
         self.ai_action.triggered.connect(self._run_ai_predict)
         toolbar.addAction(self.ai_action)
 
-        self.batch_ai_action = QAction("批量 AI 预标注", self)
+        self.batch_ai_action = QAction("AI 批量预标注", self)
         self.batch_ai_action.triggered.connect(self._run_batch_ai_predict)
         toolbar.addAction(self.batch_ai_action)
 
-        self.batch_stop_action = QAction("停止批量预标注", self)
-        self.batch_stop_action.triggered.connect(self._stop_batch_ai_predict)
-        self.batch_stop_action.setEnabled(False)
-        toolbar.addAction(self.batch_stop_action)
-
         toolbar.addSeparator()
-        self.delete_action = QAction("删除选中框（Backspace）", self)
-        self.delete_action.setToolTip("选中标注框后按 Backspace 删除。")
+        self.delete_action = QAction("删除选中框", self)
+        self.delete_action.setToolTip("删除选中的框。")
         self.delete_action.triggered.connect(self._delete_selected_box)
         toolbar.addAction(self.delete_action)
 
         toolbar.addSeparator()
-        self.clear_current_action = QAction("清空当前画面标注", self)
-        self.clear_current_action.setToolTip(
-            "清空当前画面标注；保存时删除对应标签。"
-        )
+        self.clear_current_action = QAction("清空当前画面", self)
+        self.clear_current_action.setToolTip("清空当前画面的所有框。")
         self.clear_current_action.triggered.connect(
             self._clear_current_frame_annotations
         )
         toolbar.addAction(self.clear_current_action)
 
-        self.clear_cache_action = QAction("清空未保存标注缓存", self)
-        self.clear_cache_action.setToolTip(
-            "丢弃当前文件的未保存修改，不影响已保存标签。"
-        )
+        self.clear_cache_action = QAction("放弃修改", self)
+        self.clear_cache_action.setToolTip("放弃当前文件未保存的修改。")
         self.clear_cache_action.triggered.connect(
             self._clear_unsaved_annotation_cache
         )
@@ -1723,9 +1701,7 @@ class AnnotatorWindow(QMainWindow):
         self.file_filter = QLineEdit()
         self.file_filter.setPlaceholderText("输入文件名或相对路径关键词")
         self.file_filter.setClearButtonEnabled(True)
-        self.file_filter.setToolTip(
-            "按文件名或相对路径筛选文件列表。"
-        )
+        self.file_filter.setToolTip("按文件名或相对路径搜索。")
         self.file_filter.textChanged.connect(self._filter_file_list)
         search_layout = QHBoxLayout()
         search_layout.setContentsMargins(0, 0, 0, 0)
@@ -1919,9 +1895,7 @@ class AnnotatorWindow(QMainWindow):
         self.app_settings.setValue("validation/dual_model_mode", self.validation_model_mode)
         self.app_settings.setValue("validation/dual_model_overlap_iou", self.validation_overlap_iou)
         self.app_settings.sync()
-        self.open_camera_action.setToolTip(
-            f"打开设置中选择的本机摄像头（设备 {self.camera_device_index}）；无需先打开数据集。"
-        )
+        self.open_camera_action.setToolTip("打开摄像头。")
         if camera_device_changed and camera_was_open:
             # 设置应用后立即重启采集线程，切换到新设备；保持当前实时验证开关状态。
             self.status_lbl.setText(
@@ -2609,13 +2583,50 @@ class AnnotatorWindow(QMainWindow):
             message = f"{message} {summary_text}"
         self.status_lbl.setText(message)
 
+    @staticmethod
+    def _segmentation_label_line(txt_path: Path) -> Optional[int]:
+        """返回 YOLO 多边形分割标签的首个行号；普通检测框标签返回 None。"""
+        try:
+            lines = txt_path.read_text(encoding="utf-8-sig").splitlines()
+        except OSError:
+            return None
+        for line_number, line in enumerate(lines, start=1):
+            parts = line.strip().split()
+            # 分割标签为：类别编号 + 至少三个 (x, y) 顶点；总数为奇数且不少于 7。
+            if len(parts) < 7 or len(parts) % 2 == 0:
+                continue
+            try:
+                class_id = int(parts[0])
+                coordinates = np.asarray([float(value) for value in parts[1:]], dtype=float)
+            except (ValueError, OverflowError):
+                continue
+            if class_id >= 0 and np.isfinite(coordinates).all():
+                return line_number
+        return None
+
     def _load_file(self, path: Path) -> bool:
-        # 切回普通媒体前先停止摄像头采集，确保设备不会被两个来源同时占用。
+        # 切换数据集上下文后、清空当前媒体状态前，先检查标签格式，避免不兼容标签被误保存覆盖。
         if (self.is_camera or self.camera_thread is not None) and not self._stop_camera():
             return False
         # 媒体切换只使旧推理结果失效，不强制中断正在运行的 YOLO 调用。
         self.validation_generation += 1
+        previous_file = self.current_file
         self._activate_file_dataset_context(path)
+        if path.suffix.lower() not in VIDEO_SUFFIXES:
+            incompatible_label = self._existing_image_label_path(path)
+            if incompatible_label is not None:
+                line_number = self._segmentation_label_line(incompatible_label)
+                if line_number is not None:
+                    if previous_file is not None:
+                        self._activate_file_dataset_context(previous_file)
+                    QMessageBox.warning(
+                        self,
+                        "标注格式不兼容",
+                        f"无法打开文件：{path.name}\n"
+                        f"匹配到的标签文件包含 YOLO 多边形分割标注（第 {line_number} 行）。\n"
+                        "当前程序仅支持矩形框标注。为避免覆盖原始标注，已拒绝打开此文件。",
+                    )
+                    return False
         self._clear_media_label_path_cache(path)
         self._stop_playback()
         self.video_fps = 30.0
@@ -2907,7 +2918,7 @@ class AnnotatorWindow(QMainWindow):
         return media_dir, context_key
 
     def _register_camera_capture(self, image_path: Path, context_key: str) -> None:
-        """将新抓拍图片加入当前数据集文件列表，并绑定正确的数据集上下文。"""
+        """将新抓拍图片加入文件列表，但不改变当前摄像头媒体状态。"""
         resolved_path = image_path.resolve()
         self.file_dataset_keys[resolved_path] = context_key
         self.file_list = [
@@ -2921,11 +2932,12 @@ class AnnotatorWindow(QMainWindow):
                 else str(path).casefold()
             )
         )
-        self.file_index = self.file_list.index(image_path)
+        # 摄像头仍是当前媒体源，不把文件列表的当前索引改成新抓拍图；
+        # 用户之后主动点击该图片时，才进入普通标注流程。
         self._refresh_file_list()
 
     def _capture_camera_frame(self) -> None:
-        """保存当前摄像头画面，再作为普通图片载入现有标注流程。"""
+        """保存当前摄像头画面并加入文件列表，保持摄像头预览继续运行。"""
         if not self.is_camera or self.frame is None:
             return
         try:
@@ -2939,21 +2951,9 @@ class AnnotatorWindow(QMainWindow):
             QMessageBox.critical(self, "摄像头抓拍失败", f"{type(exc).__name__}: {exc}")
             return
 
-        if not self._stop_camera():
-            return
-        self.validation_generation += 1
-        if self.validation_mode:
-            self.validation_mode = False
-            self.validation_mode_action.blockSignals(True)
-            self.validation_mode_action.setChecked(False)
-            self.validation_mode_action.blockSignals(False)
-            self.canvas.set_validation_mode(False)
         self._register_camera_capture(image_path, context_key)
-        if not self._load_file(image_path):
-            self.status_lbl.setText(f"抓拍图片已保存，但无法载入标注界面：{image_path}")
-            return
         self.status_lbl.setText(
-            f"已抓拍并打开图片：{image_path.name}。现在可以进行人工标注。"
+            f"抓拍图片已保存：{image_path.name}。摄像头预览继续运行，可从文件列表打开图片进行标注。"
         )
 
     # ---------- YOLO 标签读取 ----------
@@ -3410,25 +3410,28 @@ class AnnotatorWindow(QMainWindow):
         self._refresh_frame()
 
     def eventFilter(self, watched, event) -> bool:
-        """在主工作区响应 Backspace，同时保留文本输入控件的原生退格行为。"""
-        if (
-            event.type() == QEvent.KeyPress
-            and event.key() == Qt.Key_Backspace
-            and not event.isAutoRepeat()
-            and self.isActiveWindow()
-        ):
-            focus_widget = QApplication.focusWidget()
-            text_editing_widgets = (
-                QLineEdit,
-                QAbstractSpinBox,
-                QComboBox,
-                QTextEdit,
-                QPlainTextEdit,
-            )
-            if not isinstance(focus_widget, text_editing_widgets):
-                if self.delete_action.isEnabled():
-                    self._delete_selected_box()
-                    return True
+        """处理主工作区快捷键，同时保留文本输入和按钮控件的原生键盘行为。"""
+        if event.type() != QEvent.KeyPress or event.isAutoRepeat() or not self.isActiveWindow():
+            return super().eventFilter(watched, event)
+
+        # 空格切换视频/摄像头播放状态；焦点位于输入控件或按钮时不拦截。
+        focus_widget = QApplication.focusWidget()
+        protected_widgets = (
+            QLineEdit,
+            QAbstractSpinBox,
+            QComboBox,
+            QTextEdit,
+            QPlainTextEdit,
+            QPushButton,
+            QToolButton,
+        )
+        if isinstance(focus_widget, protected_widgets) or QApplication.activeModalWidget() is not None:
+            return super().eventFilter(watched, event)
+
+        if event.key() == Qt.Key_Backspace:
+            if self.delete_action.isEnabled():
+                self._delete_selected_box()
+                return True
         return super().eventFilter(watched, event)
 
     def _delete_selected_box(self) -> None:
@@ -3780,6 +3783,13 @@ class AnnotatorWindow(QMainWindow):
         self.status_lbl.setText(message)
 
     def _run_batch_ai_predict(self) -> None:
+        # 同一个工具栏按钮在批量任务运行期间承担停止操作。
+        if self.batch_thread is not None:
+            if self.batch_thread.isRunning():
+                self._stop_batch_ai_predict()
+            else:
+                self.status_lbl.setText("上一批量任务正在结束，请稍后再启动新的任务。")
+            return
         if self.validation_thread is not None:
             self.status_lbl.setText("实时验证推理尚未完成，请稍后再启动批量 AI 预标注。")
             return
@@ -3821,6 +3831,7 @@ class AnnotatorWindow(QMainWindow):
         self.batch_error_count = 0
         self.batch_skipped_count = 0
         self._batch_stopped_by_user = False
+        self._batch_stop_requested = False
         self.predicting = True
         self.status_lbl.setText(
             f"批量 AI 预标注已开始：第 {start_frame}–{end_frame} 帧，"
@@ -3896,14 +3907,19 @@ class AnnotatorWindow(QMainWindow):
     def _on_batch_thread_stopped(self) -> None:
         self.predicting = False
         self.batch_thread = None
-        self.batch_stop_action.setEnabled(False)
+        self._batch_stop_requested = False
         self._sync_ui_state()
 
     def _stop_batch_ai_predict(self) -> None:
         self._stop_playback()
-        if self.batch_thread is not None and self.batch_thread.isRunning():
+        if (
+            self.batch_thread is not None
+            and self.batch_thread.isRunning()
+            and not self._batch_stop_requested
+        ):
+            self._batch_stop_requested = True
             self.batch_thread.request_stop()
-            self.batch_stop_action.setEnabled(False)
+            self._sync_ui_state()
             self.status_lbl.setText("正在停止批量 AI 预标注，等待当前帧推理结束……")
 
     def _on_ai_error(self, file_path: str, frame_index: int, error: str) -> None:
@@ -3933,7 +3949,7 @@ class AnnotatorWindow(QMainWindow):
         )
         answer = QMessageBox.question(
             self,
-            "清空当前画面标注",
+            "清空当前画面",
             f"确定清空当前画面的 {box_count} 个标注框？\n"
             "保存后会删除对应标签；视频帧还会删除抽帧缓存图。原始照片和视频不会删除。",
             QMessageBox.Yes | QMessageBox.No,
@@ -3963,7 +3979,7 @@ class AnnotatorWindow(QMainWindow):
         cached_box_count = sum(len(boxes) for boxes in self.annotations.values())
         answer = QMessageBox.question(
             self,
-            "清空未保存标注缓存",
+            "放弃修改",
             f"将丢弃当前文件全部未保存修改（{cached_frame_count} 帧、{cached_box_count} 个框）。\n"
             "磁盘上已保存的标签不会删除。是否继续？",
             QMessageBox.Yes | QMessageBox.No,
@@ -4209,19 +4225,13 @@ class AnnotatorWindow(QMainWindow):
             return
         if self.is_camera and not self.validation_mode:
             self.playback_action.setText("抓拍")
-            self.playback_action.setToolTip("抓取当前摄像头画面并进入普通图片标注。")
+            self.playback_action.setToolTip("抓拍当前画面。")
         elif self.is_camera:
             self.playback_action.setText("暂停" if self.is_playing else "播放")
-            self.playback_action.setToolTip(
-                "暂停摄像头画面更新与实时验证。" if self.is_playing
-                else "继续摄像头画面更新与实时验证。"
-            )
+            self.playback_action.setToolTip("暂停摄像头画面。" if self.is_playing else "继续摄像头画面。")
         else:
             self.playback_action.setText("暂停" if self.is_playing else "播放")
-            self.playback_action.setToolTip(
-                "暂停当前视频播放。" if self.is_playing
-                else "连续播放当前视频；到达最后一帧时自动停止。"
-            )
+            self.playback_action.setToolTip("暂停视频。" if self.is_playing else "播放视频。")
 
     def _schedule_playback_step(self) -> None:
         if not self.is_playing or not self.is_video or self.predicting:
@@ -4296,13 +4306,18 @@ class AnnotatorWindow(QMainWindow):
             has_file and self.ai_model is not None and not self.predicting
             and not validation_busy and not self.validation_mode
         )
-        self.batch_ai_action.setEnabled(
-            has_video and self.ai_model is not None and not self.predicting
-            and not validation_busy and not self.validation_mode
+        batch_running = self.batch_thread is not None and self.batch_thread.isRunning()
+        self.batch_ai_action.setText(
+            "停止批量预标注" if batch_running else "AI 批量预标注"
         )
-        self.batch_stop_action.setEnabled(
-            self.batch_thread is not None and self.batch_thread.isRunning()
-        )
+        if batch_running:
+            self.batch_ai_action.setEnabled(not self._batch_stop_requested)
+        else:
+            self.batch_ai_action.setEnabled(
+                self.batch_thread is None
+                and has_video and self.ai_model is not None and not self.predicting
+                and not validation_busy and not self.validation_mode
+            )
         # 标注帧可能离当前帧很远，因此不能再按帧步长或相邻帧边界判断；
         # 是否存在目标由点击时的标注索引扫描决定。
         self.prev_frame_action.setEnabled(has_video and not self.predicting)
