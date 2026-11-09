@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -246,6 +247,8 @@ def discover_yolo_dataset_roots(selected_dir: Path) -> list[Path]:
 
     return sorted(set(roots), key=lambda item: (len(item.parts), str(item).casefold()))
 
+# 主模型沿用原有颜色序列；副模型使用独立且不重复的颜色序列，
+# 两组颜色互不重合，避免相同类别编号在双模型验证画面中难以区分。
 BOX_COLORS = [
     QColor(0, 255, 0),
     QColor(255, 90, 90),
@@ -253,6 +256,14 @@ BOX_COLORS = [
     QColor(255, 255, 0),
     QColor(255, 0, 255),
     QColor(0, 255, 255),
+]
+SECONDARY_BOX_COLORS = [
+    QColor(255, 128, 0),
+    QColor(128, 255, 0),
+    QColor(0, 255, 128),
+    QColor(0, 0, 255),
+    QColor(128, 0, 255),
+    QColor(255, 0, 128),
 ]
 
 # 可以直接修改这里，也可以设置环境变量 YOLO_MODEL_PATH，或在程序中点击“加载模型”。
@@ -449,6 +460,199 @@ def batch_sample_frame_numbers(start_frame: int, end_frame: int, frame_step: int
     return list(range(start, end + 1, step))
 
 
+@dataclass
+class ORBFeatureSet:
+    keypoints: list
+    descriptors: Optional[np.ndarray]
+    texture_std: float
+
+
+@dataclass
+class ORBPairAnalysis:
+    valid: bool
+    overlap_percent: Optional[float] = None
+
+
+def prepare_orb_frame(frame: np.ndarray, max_side: int = 640) -> np.ndarray:
+    """缩小并转换为 uint8 灰度图，供 ORB 特征提取。"""
+    if frame is None or frame.size == 0:
+        raise ValueError("无法分析空视频帧。")
+    if frame.ndim == 2:
+        gray = frame
+    elif frame.ndim == 3 and frame.shape[2] == 4:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGRA2GRAY)
+    elif frame.ndim == 3 and frame.shape[2] == 3:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    else:
+        raise ValueError("视频帧通道格式不受支持。")
+
+    height, width = gray.shape[:2]
+    if height < 2 or width < 2:
+        raise ValueError("视频帧尺寸过小，无法提取 ORB 特征。")
+    scale = min(1.0, float(max_side) / float(max(height, width)))
+    if scale < 1.0:
+        target_size = (
+            max(2, int(round(width * scale))),
+            max(2, int(round(height * scale))),
+        )
+        gray = cv2.resize(gray, target_size, interpolation=cv2.INTER_AREA)
+    return np.ascontiguousarray(gray, dtype=np.uint8)
+
+
+def extract_orb_features(gray: np.ndarray, orb: cv2.ORB) -> ORBFeatureSet:
+    keypoints, descriptors = orb.detectAndCompute(gray, None)
+    return ORBFeatureSet(
+        keypoints=keypoints or [],
+        descriptors=descriptors,
+        texture_std=float(np.std(gray)),
+    )
+
+
+def analyze_orb_pair(
+    reference: Optional[ORBFeatureSet],
+    current: Optional[ORBFeatureSet],
+    image_shape: tuple[int, int],
+    matcher: cv2.BFMatcher,
+) -> ORBPairAnalysis:
+    """用 ORB 匹配和 RANSAC 单应性估算两帧视野交叠比例。"""
+    if reference is None or current is None:
+        return ORBPairAnalysis(False)
+
+    ref_count = len(reference.keypoints)
+    cur_count = len(current.keypoints)
+    if reference.texture_std < 3.0 or current.texture_std < 3.0:
+        return ORBPairAnalysis(False)
+    if ref_count < 30 or cur_count < 30:
+        return ORBPairAnalysis(False)
+    if reference.descriptors is None or current.descriptors is None:
+        return ORBPairAnalysis(False)
+
+    try:
+        pairs = matcher.knnMatch(reference.descriptors, current.descriptors, k=2)
+        candidates = [
+            pair[0]
+            for pair in pairs
+            if len(pair) >= 2 and pair[0].distance < 0.75 * pair[1].distance
+        ]
+        # 同一当前帧特征只保留距离最小的一条匹配，降低重复匹配对模型的干扰。
+        candidates.sort(key=lambda item: item.distance)
+        matches = []
+        used_train_indices = set()
+        for match in candidates:
+            if match.trainIdx in used_train_indices:
+                continue
+            used_train_indices.add(match.trainIdx)
+            matches.append(match)
+    except (cv2.error, TypeError, ValueError):
+        return ORBPairAnalysis(False)
+
+    if len(matches) < 12:
+        return ORBPairAnalysis(False)
+
+    source_points = np.float32(
+        [reference.keypoints[item.queryIdx].pt for item in matches]
+    ).reshape(-1, 1, 2)
+    target_points = np.float32(
+        [current.keypoints[item.trainIdx].pt for item in matches]
+    ).reshape(-1, 1, 2)
+    try:
+        homography, mask = cv2.findHomography(
+            source_points, target_points, cv2.RANSAC, 3.0
+        )
+    except cv2.error:
+        return ORBPairAnalysis(False)
+    if homography is None or mask is None or not np.isfinite(homography).all():
+        return ORBPairAnalysis(False)
+
+    inlier_mask = mask.ravel().astype(bool)
+    inlier_count = int(np.count_nonzero(inlier_mask))
+    inlier_ratio = inlier_count / float(max(1, len(matches)))
+    if inlier_count:
+        inlier_source = source_points.reshape(-1, 2)[inlier_mask]
+        inlier_target = target_points.reshape(-1, 2)[inlier_mask]
+        try:
+            projected = cv2.perspectiveTransform(
+                inlier_source.reshape(-1, 1, 2), homography
+            ).reshape(-1, 2)
+        except cv2.error:
+            return ORBPairAnalysis(False)
+        median_error = float(np.median(np.linalg.norm(projected - inlier_target, axis=1)))
+    else:
+        median_error = None
+
+    if inlier_count < 10 or inlier_ratio < 0.25:
+        return ORBPairAnalysis(False)
+    if median_error is None or not np.isfinite(median_error) or median_error > 4.0:
+        return ORBPairAnalysis(False)
+
+    height, width = image_shape
+    reference_corners = np.float32([
+        [0.0, 0.0], [float(width), 0.0],
+        [float(width), float(height)], [0.0, float(height)],
+    ]).reshape(-1, 1, 2)
+    try:
+        projected_corners = cv2.perspectiveTransform(
+            reference_corners, homography
+        ).reshape(-1, 2)
+    except cv2.error:
+        return ORBPairAnalysis(False)
+    if not np.isfinite(projected_corners).all():
+        return ORBPairAnalysis(False)
+    if float(np.max(np.abs(projected_corners))) > max(width, height) * 20.0:
+        return ORBPairAnalysis(False)
+
+    projected_contour = projected_corners.astype(np.float32).reshape(-1, 1, 2)
+    projected_area = abs(float(cv2.contourArea(projected_contour)))
+    frame_area = float(width * height)
+    if projected_area < frame_area * 0.02 or projected_area > frame_area * 100.0:
+        return ORBPairAnalysis(False)
+    if not cv2.isContourConvex(projected_contour):
+        return ORBPairAnalysis(False)
+
+    current_corners = np.float32([
+        [0.0, 0.0], [float(width), 0.0],
+        [float(width), float(height)], [0.0, float(height)],
+    ])
+    try:
+        intersection_area, _ = cv2.intersectConvexConvex(
+            projected_corners.astype(np.float32), current_corners
+        )
+    except cv2.error:
+        return ORBPairAnalysis(False)
+    if not np.isfinite(float(intersection_area)):
+        return ORBPairAnalysis(False)
+
+    overlap = min(100.0, max(0.0, float(intersection_area) / frame_area * 100.0))
+    return ORBPairAnalysis(True, overlap_percent=overlap)
+
+
+def adaptive_orb_detection_interval(
+    overlap_percent: float,
+    previous_overlap: Optional[float],
+    previous_frame: Optional[int],
+    current_frame: int,
+    threshold: float,
+    base_step: int,
+) -> int:
+    """根据重叠率下降速度调整检测间隔；默认基准 5 帧，对应 2～10 帧。"""
+    base = max(1, int(base_step))
+    minimum = max(1, base // 2)
+    maximum = max(minimum, base * 2)
+    if overlap_percent <= threshold + 5.0:
+        return minimum
+    if previous_overlap is None or previous_frame is None:
+        return base
+
+    elapsed = max(1, int(current_frame) - int(previous_frame))
+    decline_rate = (float(previous_overlap) - float(overlap_percent)) / elapsed
+    if decline_rate <= 0.02:
+        return maximum
+    frames_to_threshold = max(0.0, (float(overlap_percent) - float(threshold)) / decline_rate)
+    predicted_interval = int(frames_to_threshold * 0.5)
+    return min(maximum, max(minimum, predicted_interval))
+
+
+
 def infer_yolo_multiscale(
     model,
     image: np.ndarray,
@@ -634,12 +838,12 @@ class CameraCaptureThread(QThread):
 
 
 class BatchPredictThread(QThread):
-    """按固定帧步长扫描视频，支持多分辨率推理与跨尺度融合。"""
+    """顺序扫描视频；固定模式按间隔推理，智能模式按 ORB 重叠率自适应检测。"""
 
-    frame_result = pyqtSignal(int, list, int, int)
-    progress_signal = pyqtSignal(int, int)
+    frame_result = pyqtSignal(int, object, int, int, object)
+    progress_signal = pyqtSignal(int, int, object)
     error_signal = pyqtSignal(int, str)
-    completed_signal = pyqtSignal(int, int, bool, bool)
+    completed_signal = pyqtSignal(int, int, bool, bool, int, int)
 
     def __init__(
         self,
@@ -654,6 +858,11 @@ class BatchPredictThread(QThread):
         min_box_side: int = 0,
         start_frame: int = 1,
         end_frame: Optional[int] = None,
+        sampling_mode: str = "fixed",
+        overlap_threshold: float = 70.0,
+        orb_nfeatures: int = 2000,
+        orb_max_side: int = 640,
+        smart_base_step: int = 5,
     ):
         super().__init__()
         self.model = model
@@ -665,11 +874,17 @@ class BatchPredictThread(QThread):
             raise ValueError("批量推理帧范围超出视频长度或起止顺序无效。")
         self.range_total_frames = self.end_frame - self.start_frame + 1
         self.frame_step = max(1, int(frame_step))
+        self.fallback_frame_gap = self.frame_step
         self.conf = float(conf)
         self.iou = float(iou)
         self.imgsz_values = tuple(int(v) for v in imgsz_values)
         self.max_det = int(max_det)
         self.min_box_side = max(0, int(min_box_side))
+        self.sampling_mode = "smart" if str(sampling_mode).lower() == "smart" else "fixed"
+        self.overlap_threshold = min(99.0, max(1.0, float(overlap_threshold)))
+        self.orb_nfeatures = min(10000, max(100, int(orb_nfeatures)))
+        self.orb_max_side = min(1920, max(320, int(orb_max_side)))
+        self.smart_base_step = min(30, max(1, int(smart_base_step)))
         self._stop_event = threading.Event()
 
     def request_stop(self) -> None:
@@ -693,16 +908,17 @@ class BatchPredictThread(QThread):
         stopped = False
         fatal_error = False
         scanned_frames = 0
+        valid_comparisons = 0
+        fallback_samples = 0
+        latest_overlap_percent: Optional[float] = None
         try:
             if not cap.isOpened():
                 raise RuntimeError(f"无法打开视频：{self.video_path}")
 
             start_index = self.start_frame - 1
             end_index = self.end_frame - 1
-
-            # 先定位到起始帧，避免为无效前段执行解码和推理。部分视频后端不支持
-            # 精确定位；定位失败或返回位置异常时，退回顺序解码并跳过前段。
             if start_index > 0:
+                # 起始帧只定位一次；进入范围后始终通过 read() 顺序解码。
                 seek_ok = cap.set(cv2.CAP_PROP_POS_FRAMES, start_index)
                 reported_position = cap.get(cv2.CAP_PROP_POS_FRAMES)
                 if (not seek_ok) or (
@@ -722,6 +938,16 @@ class BatchPredictThread(QThread):
                         stopped = True
                         return
 
+            smart_mode = self.sampling_mode == "smart"
+            orb = cv2.ORB_create(nfeatures=self.orb_nfeatures) if smart_mode else None
+            matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False) if smart_mode else None
+            reference_features: Optional[ORBFeatureSet] = None
+            next_detection_frame = start_index
+            last_valid_overlap: Optional[float] = None
+            last_valid_frame: Optional[int] = None
+            fallback_anchor_frame = start_index
+            min_detection_step = max(1, self.smart_base_step // 2)
+
             frame_index = start_index
             while frame_index <= end_index and not self._stop_event.is_set():
                 ok, frame = cap.read()
@@ -730,34 +956,274 @@ class BatchPredictThread(QThread):
 
                 scanned_frames = frame_index - start_index + 1
                 relative_index = frame_index - start_index
-                if relative_index % self.frame_step == 0:
+                should_sample = False
+                should_detect = False
+                used_fallback = False
+                yolo_success = False
+                current_features: Optional[ORBFeatureSet] = None
+                analysis: Optional[ORBPairAnalysis] = None
+
+                if not smart_mode:
+                    should_sample = (relative_index % self.frame_step == 0)
+                else:
+                    should_detect = frame_index >= next_detection_frame
+                    if should_detect:
+                        try:
+                            current_gray = prepare_orb_frame(frame, self.orb_max_side)
+                            current_features = extract_orb_features(current_gray, orb)
+                        except (ValueError, cv2.error):
+                            current_gray = None
+                            current_features = None
+
+                        if reference_features is None:
+                            should_sample = True
+                        else:
+                            if current_features is not None:
+                                analysis = analyze_orb_pair(
+                                    reference_features,
+                                    current_features,
+                                    current_gray.shape[:2],
+                                    matcher,
+                                )
+                            else:
+                                analysis = ORBPairAnalysis(False)
+
+                            if analysis.valid:
+                                valid_comparisons += 1
+                                fallback_anchor_frame = frame_index
+                                latest_overlap_percent = analysis.overlap_percent
+                                should_sample = analysis.overlap_percent < self.overlap_threshold
+                                next_interval = adaptive_orb_detection_interval(
+                                    analysis.overlap_percent,
+                                    last_valid_overlap,
+                                    last_valid_frame,
+                                    frame_index,
+                                    self.overlap_threshold,
+                                    self.smart_base_step,
+                                )
+                                last_valid_overlap = analysis.overlap_percent
+                                last_valid_frame = frame_index
+                            else:
+                                frames_since_valid = max(0, frame_index - fallback_anchor_frame)
+                                if frames_since_valid >= self.fallback_frame_gap:
+                                    should_sample = True
+                                    used_fallback = True
+                                next_interval = min_detection_step
+
+                        if should_sample:
+                            next_interval = self.smart_base_step
+                        else:
+                            next_detection_frame = frame_index + max(
+                                1, int(next_interval or self.smart_base_step)
+                            )
+
+                if should_sample:
+                    frame_h, frame_w = frame.shape[:2]
+                    boxes = None
                     try:
                         boxes = self._infer(frame)
-                        frame_h, frame_w = frame.shape[:2]
-                        self.frame_result.emit(frame_index, boxes, frame_w, frame_h)
+                        yolo_success = True
                     except Exception as exc:
                         failed += 1
                         error_text = f"{type(exc).__name__}: {exc}"
                         self.error_signal.emit(frame_index, error_text)
-                        sampled += 1
-                        self.progress_signal.emit(scanned_frames, self.range_total_frames)
                         if "out of memory" in error_text.lower() or "cuda error: out of memory" in error_text.lower():
                             fatal_error = True
-                            break
-                    else:
-                        sampled += 1
-                        self.progress_signal.emit(scanned_frames, self.range_total_frames)
+                        if smart_mode:
+                            # 推理失败时不切换参考帧，避免丢弃上一有效覆盖基准。
+                            next_detection_frame = frame_index + self.smart_base_step
+                    # 每次触发 YOLO 都只发出一次画面更新；None 表示推理失败，不代表空标注。
+                    self.frame_result.emit(frame_index, boxes, frame_w, frame_h, frame)
+                    sampled += 1
+
+                    if smart_mode:
+                        if yolo_success and current_features is not None:
+                            # 只在 YOLO 推理成功后更新参考帧；本帧 ORB 特征直接复用。
+                            reference_features = current_features
+                            last_valid_overlap = None
+                            last_valid_frame = None
+                            fallback_anchor_frame = frame_index
+                        if not yolo_success:
+                            fallback_anchor_frame = frame_index
+                        # 采样后按基准间隔重新检测，避免逐帧重复推理。
+                        next_detection_frame = frame_index + self.smart_base_step
+                        if used_fallback:
+                            fallback_samples += 1
+
+                if should_sample or (smart_mode and (should_detect or scanned_frames % 10 == 0)):
+                    self.progress_signal.emit(
+                        scanned_frames, self.range_total_frames, latest_overlap_percent
+                    )
+                if fatal_error:
+                    break
                 frame_index += 1
 
             if scanned_frames:
-                self.progress_signal.emit(scanned_frames, self.range_total_frames)
+                self.progress_signal.emit(
+                    scanned_frames, self.range_total_frames, latest_overlap_percent
+                )
             stopped = self._stop_event.is_set()
         except Exception as exc:
             failed += 1
             self.error_signal.emit(-1, f"{type(exc).__name__}: {exc}")
         finally:
             cap.release()
-            self.completed_signal.emit(sampled, failed, stopped, fatal_error)
+            self.completed_signal.emit(
+                sampled, failed, stopped, fatal_error,
+                valid_comparisons, fallback_samples,
+            )
+
+
+class BatchSamplingDialog(QDialog):
+    """批量预标注参数；范围与采样策略仅在启动批量任务时配置。"""
+
+    def __init__(
+        self,
+        start_frame: int,
+        end_frame: int,
+        total_frames: int,
+        frame_step: int = 30,
+        smart_enabled: bool = False,
+        overlap_threshold: float = 70.0,
+        orb_nfeatures: int = 2000,
+        orb_max_side: int = 640,
+        smart_base_step: int = 5,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("批量 AI 预标注")
+        self.setModal(True)
+        self.setMinimumWidth(400)
+
+        self.total_frames = max(1, int(total_frames))
+        self.start_frame_spin = QSpinBox()
+        self.start_frame_spin.setRange(1, self.total_frames)
+        self.start_frame_spin.setValue(min(max(1, int(start_frame)), self.total_frames))
+        self.start_frame_spin.setToolTip("批量处理起始帧，按 1 开始计数。")
+
+        self.end_frame_spin = QSpinBox()
+        self.end_frame_spin.setRange(1, self.total_frames)
+        self.end_frame_spin.setValue(min(max(1, int(end_frame)), self.total_frames))
+        self.end_frame_spin.setToolTip("批量处理结束帧，包含该帧。")
+
+        self.range_summary = QLabel()
+        self.range_summary.setStyleSheet("color: palette(mid);")
+        self.start_frame_spin.valueChanged.connect(self._update_range_summary)
+        self.end_frame_spin.valueChanged.connect(self._update_range_summary)
+
+        range_form = QFormLayout()
+        range_form.addRow("起始帧", self.start_frame_spin)
+        range_form.addRow("结束帧（包含）", self.end_frame_spin)
+        range_form.addRow(self.range_summary)
+        self.range_group = QGroupBox("处理范围")
+        self.range_group.setLayout(range_form)
+
+        self.frame_step_spin = QSpinBox()
+        self.frame_step_spin.setRange(1, 100000)
+        self.frame_step_spin.setSingleStep(1)
+        self.frame_step_spin.setValue(min(100000, max(1, int(frame_step))))
+        self.frame_step_spin.setToolTip(
+            "固定模式下作为采样间隔；智能模式下，作为配准失败后的兜底帧数。"
+        )
+        self.frame_step_label = QLabel()
+
+        self.smart_overlap_check = QCheckBox("智能重叠率")
+        self.smart_overlap_check.setChecked(bool(smart_enabled))
+
+        self.overlap_threshold_spin = QDoubleSpinBox()
+        self.overlap_threshold_spin.setRange(5.0, 99.0)
+        self.overlap_threshold_spin.setDecimals(0)
+        self.overlap_threshold_spin.setSingleStep(5.0)
+        self.overlap_threshold_spin.setSuffix(" %")
+        self.overlap_threshold_spin.setValue(min(99.0, max(5.0, float(overlap_threshold))))
+
+        self.orb_nfeatures_spin = QSpinBox()
+        self.orb_nfeatures_spin.setRange(100, 10000)
+        self.orb_nfeatures_spin.setSingleStep(100)
+        self.orb_nfeatures_spin.setValue(min(10000, max(100, int(orb_nfeatures))))
+        self.orb_nfeatures_spin.setToolTip("每次检测最多提取的 ORB 特征点数量。")
+
+        self.orb_max_side_spin = QSpinBox()
+        self.orb_max_side_spin.setRange(320, 1920)
+        self.orb_max_side_spin.setSingleStep(64)
+        self.orb_max_side_spin.setSuffix(" px")
+        self.orb_max_side_spin.setValue(min(1920, max(320, int(orb_max_side))))
+        self.orb_max_side_spin.setToolTip("ORB 分析图的最长边尺寸。")
+
+        self.smart_base_step_spin = QSpinBox()
+        self.smart_base_step_spin.setRange(1, 30)
+        self.smart_base_step_spin.setSingleStep(1)
+        self.smart_base_step_spin.setSuffix(" 帧")
+        self.smart_base_step_spin.setValue(min(30, max(1, int(smart_base_step))))
+        self.smart_base_step_spin.setToolTip("自适应 ORB 检测间隔的基准值。")
+
+        smart_form = QFormLayout()
+        smart_form.addRow("重叠率阈值", self.overlap_threshold_spin)
+        smart_form.addRow("ORB 特征点数", self.orb_nfeatures_spin)
+        smart_form.addRow("分析图最长边", self.orb_max_side_spin)
+        smart_form.addRow("检测步长基准", self.smart_base_step_spin)
+        self.smart_options_group = QGroupBox("智能采样参数")
+        self.smart_options_group.setLayout(smart_form)
+
+        self.mode_hint = QLabel("低于阈值时标注。")
+        self.cache_hint = QLabel("结果需手动保存。")
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("开始批量预标注")
+        buttons.button(QDialogButtonBox.Cancel).setText("取消")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.range_group)
+        layout.addWidget(self.smart_overlap_check)
+        step_form = QFormLayout()
+        step_form.addRow(self.frame_step_label, self.frame_step_spin)
+        layout.addLayout(step_form)
+        layout.addWidget(self.smart_options_group)
+        layout.addWidget(self.mode_hint)
+        layout.addWidget(self.cache_hint)
+        layout.addWidget(buttons)
+        self.smart_overlap_check.toggled.connect(self._update_sampling_controls)
+        self._update_sampling_controls(bool(smart_enabled))
+        self._update_range_summary()
+
+    def _update_range_summary(self, *_args) -> None:
+        start = self.start_frame_spin.value()
+        end = self.end_frame_spin.value()
+        count = max(0, end - start + 1)
+        self.range_summary.setText(f"共 {count} / {self.total_frames} 帧")
+
+    def _update_sampling_controls(self, smart_enabled: bool) -> None:
+        enabled = bool(smart_enabled)
+        self.frame_step_label.setText(
+            "失败兜底间隔（帧）" if enabled else "固定采样间隔（帧）"
+        )
+        self.smart_options_group.setEnabled(enabled)
+        self.mode_hint.setText("低于阈值时标注。" if enabled else "按固定间隔标注。")
+
+    def accept(self) -> None:
+        start = self.start_frame_spin.value()
+        end = self.end_frame_spin.value()
+        if not (1 <= start <= end <= self.total_frames):
+            QMessageBox.warning(
+                self, "批量处理范围无效", "结束帧不能早于起始帧或超过视频总帧数。"
+            )
+            self.end_frame_spin.setFocus()
+            return
+        super().accept()
+
+    def values(self) -> dict:
+        return {
+            "smart_enabled": self.smart_overlap_check.isChecked(),
+            "overlap_threshold": self.overlap_threshold_spin.value(),
+            "start_frame": self.start_frame_spin.value(),
+            "end_frame": self.end_frame_spin.value(),
+            "frame_step": self.frame_step_spin.value(),
+            "orb_nfeatures": self.orb_nfeatures_spin.value(),
+            "orb_max_side": self.orb_max_side_spin.value(),
+            "smart_base_step": self.smart_base_step_spin.value(),
+        }
 
 
 class LabelChooserDialog(QDialog):
@@ -861,11 +1327,6 @@ class ModelSettingsDialog(QDialog):
         iou: float,
         imgsz: int,
         max_det: int,
-        frame_step: int,
-        batch_start_frame: int,
-        batch_end_frame: int,
-        video_total_frames: int,
-        video_available: bool,
         multiscale_enabled: bool,
         multiscale_sizes: str,
         show_validation_imgsz: bool,
@@ -1018,37 +1479,6 @@ class ModelSettingsDialog(QDialog):
             self.manual_replace_overlap_iou_spin.setEnabled
         )
 
-        self.frame_step_spin = QSpinBox()
-        self.frame_step_spin.setRange(1, 100000)
-        self.frame_step_spin.setSingleStep(1)
-        self.frame_step_spin.setValue(frame_step)
-        self.frame_step_spin.setToolTip(
-            "批量推理每隔指定帧数处理一次。"
-        )
-
-        self.video_total_frames = max(1, int(video_total_frames))
-        self.video_available = bool(video_available)
-        self.batch_start_frame_spin = QSpinBox()
-        self.batch_start_frame_spin.setRange(1, self.video_total_frames)
-        self.batch_start_frame_spin.setValue(
-            min(max(1, int(batch_start_frame)), self.video_total_frames)
-        )
-        self.batch_start_frame_spin.setToolTip(
-            "批量推理起始帧，按 1 开始计数。"
-        )
-        self.batch_end_frame_spin = QSpinBox()
-        self.batch_end_frame_spin.setRange(1, self.video_total_frames)
-        self.batch_end_frame_spin.setValue(
-            min(max(1, int(batch_end_frame)), self.video_total_frames)
-        )
-        self.batch_end_frame_spin.setToolTip("批量推理结束帧，包含该帧。")
-
-        self.batch_range_group = QGroupBox("批量 AI 处理范围")
-        batch_range_form = QFormLayout(self.batch_range_group)
-        batch_range_form.addRow("起始帧（从 1 开始）", self.batch_start_frame_spin)
-        batch_range_form.addRow("结束帧（包含）", self.batch_end_frame_spin)
-        self.batch_range_group.setToolTip("仅对当前视频有效；切换视频后重置。")
-        self.batch_range_group.setEnabled(self.video_available)
 
         form = QFormLayout()
         form.addRow("置信度阈值（conf）", self.conf_spin)
@@ -1057,8 +1487,6 @@ class ModelSettingsDialog(QDialog):
         form.addRow("每帧最大检测数", self.max_det_spin)
         form.addRow("最小目标边长", self.min_box_side_spin)
         form.addRow(self.manual_replace_overlap_check, self.manual_replace_overlap_iou_spin)
-        form.addRow("批量视频采样间隔（帧）", self.frame_step_spin)
-        form.addRow(self.batch_range_group)
         # 摄像头和副模型属于低频使用的扩展功能，放在设置末尾。
         form.addRow(self.camera_group)
         form.addRow(self.dual_model_group)
@@ -1107,16 +1535,6 @@ class ModelSettingsDialog(QDialog):
         self.show_validation_imgsz_check.setEnabled(bool(multiscale_enabled))
 
     def accept(self) -> None:
-        start_frame = self.batch_start_frame_spin.value()
-        end_frame = self.batch_end_frame_spin.value()
-        if self.video_available and not (1 <= start_frame <= end_frame <= self.video_total_frames):
-            QMessageBox.warning(
-                self,
-                "批量处理范围无效",
-                f"起始帧需大于 0，结束帧需不早于起始帧，且不超过视频总帧数（{self.video_total_frames}）。",
-            )
-            self.batch_end_frame_spin.setFocus()
-            return
         if self.multiscale_check.isChecked():
             try:
                 parse_multiscale_sizes(self.multiscale_sizes_edit.text())
@@ -1137,12 +1555,9 @@ class ModelSettingsDialog(QDialog):
             self.min_box_side_spin.value(),
             self.manual_replace_overlap_check.isChecked(),
             self.manual_replace_overlap_iou_spin.value(),
-            self.frame_step_spin.value(),
             enabled,
             sizes_text,
             self.show_validation_imgsz_check.isChecked(),
-            self.batch_start_frame_spin.value(),
-            self.batch_end_frame_spin.value(),
             int(self.camera_device_combo.currentData()),
             self.secondary_model_edit.text().strip(),
             str(self.validation_model_mode_combo.currentData()),
@@ -1267,7 +1682,12 @@ class Canvas(QWidget):
 
         visible_boxes = self._validation_boxes if self._validation_mode else self._boxes
         for index, box in enumerate(visible_boxes):
-            color = BOX_COLORS[int(box["class_id"]) % len(BOX_COLORS)]
+            class_id = int(box["class_id"])
+            if self._validation_mode and box.get("model_index") == 2:
+                color_sequence = SECONDARY_BOX_COLORS
+            else:
+                color_sequence = BOX_COLORS
+            color = color_sequence[class_id % len(color_sequence)]
             rect = QRectF(
                 ox + float(box["x1"]) * scale,
                 oy + float(box["y1"]) * scale,
@@ -1507,15 +1927,24 @@ class AnnotatorWindow(QMainWindow):
         self.multiscale_enabled = self.app_settings.value("inference/multiscale_enabled", False, type=bool)
         self.multiscale_sizes = str(self.app_settings.value("inference/multiscale_sizes", "640, 1280, 1920"))
         self.frame_step = self._read_int_setting("video/frame_step", 30, 1, 100000)
+        self.orb_nfeatures = self._read_int_setting("video/orb_nfeatures", 2000, 100, 10000)
+        self.orb_max_side = self._read_int_setting("video/orb_max_side", 640, 320, 1920)
+        self.smart_base_step = self._read_int_setting("video/smart_base_step", 5, 1, 30)
         # 批量处理范围仅属于当前视频，不写入全局设置；每次切换视频时重置。
         self.batch_start_frame = 1
         self.batch_end_frame = 1
+        # 智能重叠率默认关闭；本次运行中记住上次选择。
+        self.batch_smart_overlap_enabled = False
+        self.batch_overlap_threshold = 70.0
         self.batch_thread: Optional[BatchPredictThread] = None
         self.batch_added_count = 0
         self.batch_error_count = 0
         self.batch_skipped_count = 0
         self._batch_stopped_by_user = False
         self._batch_stop_requested = False
+        # 批量预标注期间主画面跟随每个成功采样帧；任务结束后恢复原选中画面。
+        self._batch_restore_state: Optional[tuple[Optional[np.ndarray], int, int, int]] = None
+        self._batch_final_status_text = ""
         self._updating_file_list = False
 
         self._build_ui()
@@ -1757,11 +2186,6 @@ class AnnotatorWindow(QMainWindow):
             self.inference_iou,
             self.inference_imgsz,
             self.inference_max_det,
-            self.frame_step,
-            self.batch_start_frame,
-            self.batch_end_frame,
-            self.total_frames if self.is_video and self.current_file is not None else 1,
-            self.is_video and self.current_file is not None and self.total_frames > 0,
             self.multiscale_enabled,
             self.multiscale_sizes,
             self.show_validation_imgsz,
@@ -1786,12 +2210,9 @@ class AnnotatorWindow(QMainWindow):
                 new_inference_min_box_side,
                 new_manual_replace_overlap_enabled,
                 new_manual_replace_overlap_iou,
-                new_frame_step,
                 new_multiscale_enabled,
                 new_multiscale_sizes,
                 new_show_validation_imgsz,
-                new_batch_start_frame,
-                new_batch_end_frame,
                 new_camera_device_index,
                 secondary_model_path_text,
                 new_validation_model_mode,
@@ -1840,12 +2261,9 @@ class AnnotatorWindow(QMainWindow):
             self.inference_min_box_side,
             self.manual_replace_overlap_enabled,
             self.manual_replace_overlap_iou,
-            self.frame_step,
             self.multiscale_enabled,
             self.multiscale_sizes,
             self.show_validation_imgsz,
-            self.batch_start_frame,
-            self.batch_end_frame,
         ) = (
             new_inference_conf,
             new_inference_iou,
@@ -1854,12 +2272,9 @@ class AnnotatorWindow(QMainWindow):
             new_inference_min_box_side,
             new_manual_replace_overlap_enabled,
             new_manual_replace_overlap_iou,
-            new_frame_step,
             new_multiscale_enabled,
             new_multiscale_sizes,
             new_show_validation_imgsz,
-            new_batch_start_frame,
-            new_batch_end_frame,
         )
         self.secondary_model_path = new_secondary_path
         self.secondary_ai_model = new_secondary_model
@@ -1884,7 +2299,6 @@ class AnnotatorWindow(QMainWindow):
         self.app_settings.setValue(
             "inference/show_validation_imgsz", self.show_validation_imgsz
         )
-        self.app_settings.setValue("video/frame_step", self.frame_step)
         camera_device_changed = new_camera_device_index != self.camera_device_index
         self.camera_device_index = new_camera_device_index
         self.app_settings.setValue("camera/device_index", self.camera_device_index)
@@ -1911,8 +2325,6 @@ class AnnotatorWindow(QMainWindow):
                 f"新框重叠清理={self.manual_replace_overlap_enabled} "
                 f"(IoU={self.manual_replace_overlap_iou:.2f}), "
                 f"多分辨率推理={self.multiscale_enabled} ({self.multiscale_sizes}), "
-                f"批量采样间隔={self.frame_step} 帧, "
-                f"当前视频批量范围={self.batch_start_frame}-{self.batch_end_frame}, "
                 f"摄像头设备={self.camera_device_index}"
             )
         if self.validation_mode:
@@ -2584,49 +2996,83 @@ class AnnotatorWindow(QMainWindow):
         self.status_lbl.setText(message)
 
     @staticmethod
-    def _segmentation_label_line(txt_path: Path) -> Optional[int]:
-        """返回 YOLO 多边形分割标签的首个行号；普通检测框标签返回 None。"""
+    def _validate_yolo_label_file(txt_path: Path) -> Optional[tuple[int, str]]:
+        """验证标签是否完全符合当前矩形框格式；返回首个问题的行号和原因。"""
         try:
             lines = txt_path.read_text(encoding="utf-8-sig").splitlines()
-        except OSError:
-            return None
+        except (OSError, UnicodeError) as exc:
+            return 0, f"无法读取标签文件：{exc}"
+
         for line_number, line in enumerate(lines, start=1):
             parts = line.strip().split()
-            # 分割标签为：类别编号 + 至少三个 (x, y) 顶点；总数为奇数且不少于 7。
-            if len(parts) < 7 or len(parts) % 2 == 0:
+            if not parts:
                 continue
+            if len(parts) not in (5, 6):
+                if len(parts) >= 7 and len(parts) % 2 == 1:
+                    reason = "疑似 YOLO 多边形分割标注"
+                else:
+                    reason = f"数值数量为 {len(parts)}，当前矩形框格式要求 5 或 6 个"
+                return line_number, reason
             try:
                 class_id = int(parts[0])
-                coordinates = np.asarray([float(value) for value in parts[1:]], dtype=float)
+                values = [float(value) for value in parts[1:]]
             except (ValueError, OverflowError):
+                return line_number, "包含非数字或非法类别编号"
+            if class_id < 0:
+                return line_number, "类别编号不能为负数"
+            if not np.isfinite(values).all():
+                return line_number, "坐标或置信度不是有限数值"
+            cx, cy, width, height = values[:4]
+            if width <= 0 or height <= 0:
+                return line_number, "矩形框宽度和高度必须大于 0"
+            if len(values) == 5 and not 0.0 <= values[4] <= 1.0:
+                return line_number, "置信度必须在 0 到 1 之间"
+        return None
+
+    def _incompatible_video_label(self, path: Path) -> Optional[tuple[Path, int, str]]:
+        """检查该视频已存在的帧标签，返回首个不兼容项以便提醒。"""
+        index = self._label_index()
+        relative_video = self._relative_media_path(path)
+        prefix = f"{relative_video.stem}_frame_".casefold()
+        for label_path in index["all_paths"]:
+            stem = label_path.stem
+            if not stem.casefold().startswith(prefix):
                 continue
-            if class_id >= 0 and np.isfinite(coordinates).all():
-                return line_number
+            frame_text = stem[len(prefix):]
+            if not frame_text.isdigit():
+                continue
+            issue = self._validate_yolo_label_file(label_path)
+            if issue is not None:
+                return label_path, issue[0], issue[1]
         return None
 
     def _load_file(self, path: Path) -> bool:
-        # 切换数据集上下文后、清空当前媒体状态前，先检查标签格式，避免不兼容标签被误保存覆盖。
+        # 切换数据集上下文后、清空当前媒体状态前检查标签格式；发现问题时提醒用户，但不阻断打开。
         if (self.is_camera or self.camera_thread is not None) and not self._stop_camera():
             return False
         # 媒体切换只使旧推理结果失效，不强制中断正在运行的 YOLO 调用。
         self.validation_generation += 1
-        previous_file = self.current_file
         self._activate_file_dataset_context(path)
-        if path.suffix.lower() not in VIDEO_SUFFIXES:
-            incompatible_label = self._existing_image_label_path(path)
-            if incompatible_label is not None:
-                line_number = self._segmentation_label_line(incompatible_label)
-                if line_number is not None:
-                    if previous_file is not None:
-                        self._activate_file_dataset_context(previous_file)
-                    QMessageBox.warning(
-                        self,
-                        "标注格式不兼容",
-                        f"无法打开文件：{path.name}\n"
-                        f"匹配到的标签文件包含 YOLO 多边形分割标注（第 {line_number} 行）。\n"
-                        "当前程序仅支持矩形框标注。为避免覆盖原始标注，已拒绝打开此文件。",
-                    )
-                    return False
+        incompatible = None
+        if path.suffix.lower() in VIDEO_SUFFIXES:
+            video_issue = self._incompatible_video_label(path)
+            if video_issue is not None:
+                label_path, line_number, reason = video_issue
+                incompatible = (label_path, line_number, reason)
+        else:
+            label_path = self._existing_image_label_path(path)
+            if label_path is not None:
+                issue = self._validate_yolo_label_file(label_path)
+                if issue is not None:
+                    incompatible = (label_path, issue[0], issue[1])
+        if incompatible is not None:
+            label_path, line_number, reason = incompatible
+            line_text = f"第 {line_number} 行" if line_number else "文件读取阶段"
+            QMessageBox.warning(
+                self,
+                "标签格式异常",
+                f"{label_path.name}（{line_text}）。\n保存可能丢失数据。",
+            )
         self._clear_media_label_path_cache(path)
         self._stop_playback()
         self.video_fps = 30.0
@@ -3036,7 +3482,9 @@ class AnnotatorWindow(QMainWindow):
 
     # ---------- 画面与帧切换 ----------
 
-    def _refresh_frame(self, reset_view: bool = False) -> None:
+    def _refresh_frame(
+        self, reset_view: bool = False, refresh_tree: bool = True
+    ) -> None:
         if self.frame is None:
             self.canvas.update()
             self.canvas.set_boxes([])
@@ -3055,7 +3503,8 @@ class AnnotatorWindow(QMainWindow):
         self.slider.setValue(self.frame_idx)
         self.slider.blockSignals(False)
         self.slider_label.setText(f"{self.frame_idx + 1} / {self.total_frames}")
-        self._refresh_tree()
+        if refresh_tree:
+            self._refresh_tree()
 
     def _seek(self, index: int, reset_view: bool = False) -> None:
         """随机定位到指定帧；仅用于用户跳转，不用于连续播放。"""
@@ -3702,6 +4151,7 @@ class AnnotatorWindow(QMainWindow):
         new_boxes: list[dict],
         ensure_empty_frame: bool = False,
         replace_existing: bool = False,
+        refresh_current: bool = True,
     ) -> tuple[int, int]:
         """映射模型类别；单帧预标注可替换旧框，批量预标注默认合并。"""
         if self.ai_model is None:
@@ -3763,7 +4213,7 @@ class AnnotatorWindow(QMainWindow):
 
         if changed:
             self._set_dirty(True)
-        if self.frame_idx == frame_index and self.frame is not None:
+        if refresh_current and self.frame_idx == frame_index and self.frame is not None:
             self._refresh_frame()
         return added, skipped
 
@@ -3806,7 +4256,6 @@ class AnnotatorWindow(QMainWindow):
             QMessageBox.warning(self, "无法批量标注", "无法读取视频帧数，暂不能批量处理。")
             return
 
-        step = max(1, int(self.frame_step))
         try:
             start_frame, end_frame = normalize_batch_frame_range(
                 self.total_frames, self.batch_start_frame, self.batch_end_frame
@@ -3814,19 +4263,56 @@ class AnnotatorWindow(QMainWindow):
         except ValueError as exc:
             QMessageBox.warning(self, "批量处理范围无效", str(exc))
             return
-        sample_count = (end_frame - start_frame) // step + 1
-        answer = QMessageBox.question(
-            self,
-            "批量 AI 预标注",
-            f"将处理第 {start_frame}–{end_frame} 帧，每隔 {step} 帧采样，共推理 {sample_count} 帧。\n"
-            "结果先写入未保存缓存；复核后请点击“保存标注”。是否开始？",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.Yes,
+
+        sampling_dialog = BatchSamplingDialog(
+            start_frame=start_frame,
+            end_frame=end_frame,
+            total_frames=self.total_frames,
+            frame_step=self.frame_step,
+            smart_enabled=self.batch_smart_overlap_enabled,
+            overlap_threshold=self.batch_overlap_threshold,
+            orb_nfeatures=self.orb_nfeatures,
+            orb_max_side=self.orb_max_side,
+            smart_base_step=self.smart_base_step,
+            parent=self,
         )
-        if answer != QMessageBox.Yes:
+        if sampling_dialog.exec_() != QDialog.Accepted:
             return
 
+        sampling_values = sampling_dialog.values()
+        smart_overlap_enabled = sampling_values["smart_enabled"]
+        overlap_threshold = sampling_values["overlap_threshold"]
+        start_frame = sampling_values["start_frame"]
+        end_frame = sampling_values["end_frame"]
+        step = sampling_values["frame_step"]
+        self.batch_start_frame = start_frame
+        self.batch_end_frame = end_frame
+        self.frame_step = step
+        self.orb_nfeatures = sampling_values["orb_nfeatures"]
+        self.orb_max_side = sampling_values["orb_max_side"]
+        self.smart_base_step = sampling_values["smart_base_step"]
+        self.batch_smart_overlap_enabled = smart_overlap_enabled
+        self.batch_overlap_threshold = overlap_threshold
+
+        # 批量任务参数在此保存；处理范围仅对当前视频有效，不写入全局设置。
+        self.app_settings.setValue("video/frame_step", self.frame_step)
+        self.app_settings.setValue("video/orb_nfeatures", self.orb_nfeatures)
+        self.app_settings.setValue("video/orb_max_side", self.orb_max_side)
+        self.app_settings.setValue("video/smart_base_step", self.smart_base_step)
+        self.app_settings.sync()
+
+        if smart_overlap_enabled:
+            sampling_description = (
+                f"智能重叠率 {overlap_threshold:.0f}%，兜底 {step} 帧"
+            )
+        else:
+            sampling_description = f"固定间隔 {step} 帧"
+
         self._stop_playback()
+        self._batch_restore_state = (
+            self.frame, self.frame_idx, self.image_w, self.image_h
+        )
+        self._batch_final_status_text = ""
         self.batch_added_count = 0
         self.batch_error_count = 0
         self.batch_skipped_count = 0
@@ -3834,8 +4320,7 @@ class AnnotatorWindow(QMainWindow):
         self._batch_stop_requested = False
         self.predicting = True
         self.status_lbl.setText(
-            f"批量 AI 预标注已开始：第 {start_frame}–{end_frame} 帧，"
-            f"采样间隔 {step} 帧，预计推理 {sample_count} 帧；处理期间请勿切换文件。"
+            f"批量预标注：第 {start_frame}–{end_frame} 帧，{sampling_description}。"
         )
 
         self.batch_thread = BatchPredictThread(
@@ -3850,6 +4335,11 @@ class AnnotatorWindow(QMainWindow):
             self.inference_min_box_side,
             start_frame=start_frame,
             end_frame=end_frame,
+            sampling_mode="smart" if smart_overlap_enabled else "fixed",
+            overlap_threshold=overlap_threshold,
+            orb_nfeatures=self.orb_nfeatures,
+            orb_max_side=self.orb_max_side,
+            smart_base_step=self.smart_base_step,
         )
         self.batch_thread.frame_result.connect(self._on_batch_frame_result)
         self.batch_thread.progress_signal.connect(self._on_batch_progress)
@@ -3860,25 +4350,51 @@ class AnnotatorWindow(QMainWindow):
         self._sync_ui_state()
 
     def _on_batch_frame_result(
-        self, frame_index: int, new_boxes: list, image_w: int, image_h: int
+        self,
+        frame_index: int,
+        new_boxes: Optional[list],
+        image_w: int,
+        image_h: int,
+        preview_frame: np.ndarray,
     ) -> None:
-        # 批量处理前先载入该帧磁盘上已有的标签，避免覆盖之前的人工标注。
+        # 批量处理只在 YOLO 成功返回后刷新一次画面，不为每个解码帧重绘。
+        self.frame = preview_frame
+        self.frame_idx = frame_index
+        self.image_w = image_w
+        self.image_h = image_h
+
+        # 先载入该帧磁盘上已有的标签，避免覆盖之前的人工标注。
         if frame_index not in self.annotations:
             existing_label = self._existing_video_frame_label_path(frame_index)
             if existing_label is not None:
                 self._load_yolo_txt(
                     existing_label, frame_index, image_w=image_w, image_h=image_h
                 )
-        added, skipped = self._apply_ai_boxes(
-            frame_index, new_boxes, ensure_empty_frame=True
-        )
-        self.batch_added_count += added
-        self.batch_skipped_count += skipped
+        if new_boxes is not None:
+            added, skipped = self._apply_ai_boxes(
+                frame_index, new_boxes, ensure_empty_frame=True, refresh_current=False
+            )
+            self.batch_added_count += added
+            self.batch_skipped_count += skipped
+        # 批量期间树形列表被禁用，无需逐次重建；结束恢复原画面时再统一刷新。
+        self._refresh_frame(refresh_tree=False)
 
-    def _on_batch_progress(self, current_frame: int, total_frames: int) -> None:
+    def _on_batch_progress(
+        self,
+        current_frame: int,
+        total_frames: int,
+        latest_overlap_percent: Optional[float] = None,
+    ) -> None:
+        overlap_text = ""
+        if self.batch_smart_overlap_enabled:
+            overlap_value = (
+                f"{latest_overlap_percent:.1f}%"
+                if latest_overlap_percent is not None else "--"
+            )
+            overlap_text = f"；最近有效重叠率 {overlap_value}"
         self.status_lbl.setText(
-            f"批量 AI 预标注进行中：已扫描所选范围 {current_frame} / {total_frames} 帧；"
-            f"新增 {self.batch_added_count} 个检测框。"
+            f"批量 AI 预标注进行中：已扫描所选范围 {current_frame} / {total_frames} 帧"
+            f"{overlap_text}；新增 {self.batch_added_count} 个检测框。"
         )
 
     def _on_batch_error(self, frame_index: int, error: str) -> None:
@@ -3887,7 +4403,13 @@ class AnnotatorWindow(QMainWindow):
         self.status_lbl.setText(f"批量 AI 预标注遇到错误（{frame_text}）：{error}")
 
     def _on_batch_completed(
-        self, sampled: int, failed: int, stopped: bool, fatal_error: bool
+        self,
+        sampled: int,
+        failed: int,
+        stopped: bool,
+        fatal_error: bool,
+        valid_comparisons: int = 0,
+        fallback_samples: int = 0,
     ) -> None:
         self._batch_stopped_by_user = stopped
         self.batch_error_count = max(self.batch_error_count, failed)
@@ -3900,15 +4422,30 @@ class AnnotatorWindow(QMainWindow):
             f"新增 {self.batch_added_count} 个检测框，失败 {self.batch_error_count} 帧，"
             f"因类别名称不匹配跳过 {self.batch_skipped_count} 个检测框。"
         )
+        if self.batch_smart_overlap_enabled:
+            result_text += (
+                f" ORB 有效配准 {valid_comparisons} 次，"
+                f"兜底采样 {fallback_samples} 次。"
+            )
         if self.dirty:
             result_text += " 请检查结果并点击顶部“保存标注”。"
+        self._batch_final_status_text = result_text
         self.status_lbl.setText(result_text)
 
     def _on_batch_thread_stopped(self) -> None:
+        # 扫描线程使用独立 VideoCapture，不改变主播放解码器；恢复任务开始前的画面与帧号即可。
+        restore_state = self._batch_restore_state
+        if restore_state is not None:
+            self.frame, self.frame_idx, self.image_w, self.image_h = restore_state
+            self._batch_restore_state = None
+            self._refresh_frame()
+
         self.predicting = False
         self.batch_thread = None
         self._batch_stop_requested = False
         self._sync_ui_state()
+        if self._batch_final_status_text:
+            self.status_lbl.setText(self._batch_final_status_text)
 
     def _stop_batch_ai_predict(self) -> None:
         self._stop_playback()
