@@ -1,56 +1,103 @@
 # YOLO Annotation Review Studio
 
-基于 PyQt5、OpenCV 和 NumPy 的本地图片/视频标注复核工具。支持人工绘框、YOLO 标签读写，以及可选的 Ultralytics YOLO AI 预标注。
+YOLO 图像与视频标注复核工具。项目采用**少量大模块**组织代码：独立算法和可复用界面组件分开，紧密耦合的主窗口流程仍集中管理，不把每组按钮或每个小功能拆成单独文件。
 
-## 环境
+## 项目结构
 
-- Python 3.9+
-- PyQt5
-- opencv-python
-- NumPy
-- `ultralytics`（仅 AI 预标注和置信度验证需要）
-
-安装依赖：
-
-```bash
-pip install PyQt5 opencv-python numpy ultralytics
+```text
+yolo-annotation-review-studio-project/
+├─ run.py                              # 推荐启动入口
+├─ yolo-annotation-review-studio.py    # 兼容旧文件名
+├─ requirements.txt                   # 基础依赖
+├─ requirements-ai.txt                # 含 Ultralytics 的 AI 依赖
+├─ pyproject.toml                      # 项目元数据
+├─ README.md                           # 使用与维护说明
+└─ yolo_annotation_review_studio/
+   ├─ config.py                        # 默认路径、媒体格式、模型路径
+   ├─ data.py                          # 数据集识别、图像/标签读写、检测框算法
+   ├─ processing.py                    # ORB、YOLO 推理、摄像头与批量线程
+   ├─ ui.py                            # 标注画布、参数/类别/模型对话框
+   ├─ window.py                        # 主窗口及各功能流程
+   └─ main.py                          # QApplication 启动入口
 ```
 
-运行：
+主窗口保留为一个整体，因为媒体状态、标注缓存、播放、摄像头和批量处理之间存在较多直接协作。只有当 `window.py` 后续继续明显膨胀，或某一部分能独立维护和测试时，再考虑拆成少数几个模块；不按方法数量机械拆分。
 
-```bash
+## 安装与运行（Windows）
+
+在项目根目录执行：
+
+```powershell
+py -3.10 -m venv .venv
+.venv\Scripts\activate
+python -m pip install --upgrade pip
+pip install -r requirements-ai.txt
+python run.py
+```
+
+若只使用不依赖 YOLO 的基础功能，可安装 `requirements.txt`。AI 预标注需要安装 `requirements-ai.txt`。
+
+也可以继续使用原文件名启动：
+
+```powershell
 python yolo-annotation-review-studio.py
 ```
 
-## 主要功能
+## 模型路径
 
-- 浏览图片和视频，支持按文件名或相对路径筛选。
-- 鼠标绘制、选择、删除和修改标注框；可设置新框与旧框的重叠替换阈值。
-- YOLO 单帧 AI 预标注和视频批量预标注；支持多分辨率融合、最小目标边长过滤。
-- 置信度验证只显示匹配结果，不修改现有标签。
-- 递归识别嵌套 YOLO 数据集，并分别维护数据集的类别和输出目录。
-- 视频可按 A/D 跳转到前后最近的有效标注帧。
+默认模型路径沿用原程序设置，也可用环境变量覆盖：
 
-## 数据与标签路径
+```powershell
+$env:YOLO_MODEL_PATH = "D:\models\best.pt"
+python run.py
+```
 
-- 每个数据集有独立输出目录，可在界面中单独设置。
-- 标签只在当前数据集的输出根目录内查找，可位于该目录下任意命名的标签子目录；不搜索其他数据集或历史输出目录。
-- 查找顺序为：先按媒体相对路径匹配；未命中时，再按文件名匹配输出目录根层的标签文件。
-- 目录和文件名按不区分大小写的路径顺序扫描。同一匹配规则出现多个候选时直接采用第一个；不比较修改时间，也不维护重名冲突处理机制。
-- 首次载入媒体时确定标签文件路径。之后保存或清空都沿用同一路径，不会把同一媒体的标签另存到第二个位置。
-- 没有找到已有标签时，新标签写入当前输出目录下的默认 `labels/` 位置。
-- 图片标签使用图片相对路径对应的 `.txt` 文件。视频帧标签使用视频相对路径、视频文件名和从 0 开始的帧序号，例如 `clip_frame_000000.txt` 对应视频第 1 帧。
-- `classes.txt` 保存类别 ID 与类别名称的映射。
-- 空标注保存时删除对应标签文件；视频帧还会删除程序导出的对应帧缓存图片，不会删除原始图片或视频。
-- 切换输出目录不会自动迁移旧标签；切换后只从新输出目录读取和保存。需要沿用旧标签时，请先将旧标签目录放入新输出目录，或继续使用原输出目录。
+模型权重、视频和数据集建议放在项目目录之外，避免误提交到版本库。
 
-## 常用操作
+## 修改代码时看哪里
 
-| 操作 | 快捷键 |
+| 需求 | 文件 |
 |---|---|
-| 保存标注 | `S` |
-| 上一标注帧 | `A` |
-| 下一标注帧 | `D` |
-| 删除选中框 | `Backspace` |
+| 默认路径、媒体扩展名 | `config.py` |
+| 数据集识别、标签路径规则、YOLO 标签与检测框算法 | `data.py` |
+| ORB 重叠率、YOLO 推理、后台线程 | `processing.py` |
+| 画布、参数设置和类别选择弹窗 | `ui.py` |
+| 播放、摄像头、实时验证、批量预标注、保存等界面流程 | `window.py` |
+| 启动流程 | `main.py`、根目录 `run.py` |
 
-AI 推理参数可在“AI 推理设置”中调整。批量视频处理范围只对当前视频有效，切换视频后会重置。
+依赖关系尽量保持单向：`config.py` 不依赖其他模块；`data.py` 不依赖 GUI；`processing.py` 调用数据/算法模块；`ui.py` 使用配置和通用算法；`window.py` 负责协调。不要让底层算法反向导入 `window.py`。
+
+## 日常项目管理（推荐 Git）
+
+Git 用来记录每次修改，避免保留多个 `final_v3_fixed.py` 文件。安装 Git 后，在项目根目录初始化一次：
+
+```powershell
+git init
+git add .
+git commit -m "Initial project"
+```
+
+之后每完成一项功能并检查通过，就提交一次：
+
+```powershell
+git status
+git diff
+git add .
+git commit -m "Improve batch preview"
+```
+
+较大的尝试先开分支：
+
+```powershell
+git switch -c feature/new-feature
+```
+
+修改满意后再合并。修改前后可用 `git diff` 看具体变化；发现问题可用 `git log` 找到上一个版本。`.gitignore` 已排除虚拟环境、缓存和模型权重。
+
+## 基础检查
+
+```powershell
+python -m compileall -q yolo_annotation_review_studio run.py
+```
+
+此命令只检查语法，不会启动窗口、摄像头或 GPU 推理。真实运行仍需在安装了 PyQt5、OpenCV 和相应 AI 依赖的环境中验证。

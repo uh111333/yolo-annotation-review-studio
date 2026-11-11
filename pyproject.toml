@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "yolo-annotation-review-studio"
+version = "1.0.0"
+description = "YOLO 图像与视频标注复核工具"
+requires-python = ">=3.9"
+dependencies = ["PyQt5>=5.15.9", "opencv-python>=4.8", "numpy>=1.24"]
+
+[project.optional-dependencies]
+ai = ["ultralytics>=8.0.0"]
+
+[project.scripts]
+yolo-annotation-review-studio = "yolo_annotation_review_studio.main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["yolo_annotation_review_studio*"]
