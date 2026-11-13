@@ -997,7 +997,8 @@ class BatchPredictThread(QThread):
         sampled = 0
         failed = 0
         stopped = False
-        source_stopped = False        fatal_error = False
+        source_stopped = False
+        fatal_error = False
         scanned_frames = 0
         valid_comparisons = 0
         fallback_samples = 0
@@ -1996,6 +1997,7 @@ class Canvas(QWidget):
             self._last_mouse_pos = None
             self.setCursor(Qt.CrossCursor)
             return
+
         if event.button() == Qt.LeftButton and self._validation_mode:
             self._drag_start = None
             self._drag_end = None
@@ -2241,7 +2243,6 @@ class AnnotatorWindow(QMainWindow):
         toolbar.addAction(self.output_dir_action)
 
         self.save_action = QAction("保存标注", self)
-        self.save_action.setShortcut("S")
         self.save_action.triggered.connect(self._save)
         toolbar.addAction(self.save_action)
 
@@ -2263,19 +2264,16 @@ class AnnotatorWindow(QMainWindow):
 
         toolbar.addSeparator()
         self.prev_frame_action = QAction("上一标注帧", self)
-        self.prev_frame_action.setShortcut("A")
         self.prev_frame_action.setToolTip("跳转到上一条有标注的帧。")
         self.prev_frame_action.triggered.connect(lambda: self._step_frame(-1))
         toolbar.addAction(self.prev_frame_action)
 
         self.playback_action = QAction("播放", self)
-        self.playback_action.setShortcut("Space")
         self.playback_action.setToolTip("播放或暂停。")
         self.playback_action.triggered.connect(self._toggle_playback)
         toolbar.addAction(self.playback_action)
 
         self.next_frame_action = QAction("下一标注帧", self)
-        self.next_frame_action.setShortcut("D")
         self.next_frame_action.setToolTip("跳转到下一条有标注的帧。")
         self.next_frame_action.triggered.connect(lambda: self._step_frame(1))
         toolbar.addAction(self.next_frame_action)
@@ -2995,7 +2993,8 @@ class AnnotatorWindow(QMainWindow):
         resolved_paths = context.setdefault("resolved_label_paths", {})
         relative = self._relative_media_path(path)
         if path.suffix.lower() in VIDEO_SUFFIXES:
-            prefix_path = relative.parent / f"{relative.stem}_frame_"            prefix = self._label_path_key(self._label_lookup_path(prefix_path))
+            prefix_path = relative.parent / f"{relative.stem}_frame_"
+            prefix = self._label_path_key(self._label_lookup_path(prefix_path))
             keys = [key for key in resolved_paths if key.startswith(prefix)]
         else:
             key = self._label_path_key(
@@ -3994,7 +3993,8 @@ class AnnotatorWindow(QMainWindow):
                     display_name = path.name
             else:
                 display_name = path.name
-            sequence = self.file_image_sequences.get(path.resolve())            tooltip = str(path)
+            sequence = self.file_image_sequences.get(path.resolve())
+            tooltip = str(path)
             if sequence and len(sequence) > 1:
                 display_name = f"{display_name}  [{len(sequence)} 张]"
                 tooltip += "\n" + "\n".join(member.name for member in sequence)
@@ -4037,6 +4037,34 @@ class AnnotatorWindow(QMainWindow):
             self.file_count_lbl.setText(f"显示 {visible} / {total} 个文件")
         else:
             self.file_count_lbl.setText("尚未加载文件夹")
+
+    def _step_file(self, delta: int) -> None:
+        """按当前文件列表的可见顺序切换文件；实际加载仍复用列表选择流程。"""
+        if self.predicting or not self.file_list:
+            return
+
+        current_row = self.file_list_widget.currentRow()
+        if current_row < 0:
+            current_row = next(
+                (
+                    row for row in range(self.file_list_widget.count())
+                    if self.file_list_widget.item(row).data(Qt.UserRole) == self.file_index
+                ),
+                -1,
+            )
+        if current_row < 0:
+            return
+
+        step = -1 if int(delta) < 0 else 1
+        target_row = current_row + step
+        while 0 <= target_row < self.file_list_widget.count():
+            item = self.file_list_widget.item(target_row)
+            if item is not None and not item.isHidden():
+                self.file_list_widget.setCurrentRow(target_row)
+                return
+            target_row += step
+
+        self.status_lbl.setText("已经是第一个文件。" if step < 0 else "已经是最后一个文件。")
 
     def _on_file_item_changed(self, current, _previous) -> None:
         if self._updating_file_list or current is None:
@@ -4197,13 +4225,85 @@ class AnnotatorWindow(QMainWindow):
         self._set_dirty(True)
         self._refresh_frame()
 
+    def _activate_dialog_confirmation(self, dialog) -> bool:
+        """激活当前模态窗口的肯定/确认按钮；不改变 Enter 的原生行为。"""
+        if isinstance(dialog, QMessageBox):
+            for standard_button in (
+                QMessageBox.Yes,
+                QMessageBox.Ok,
+                QMessageBox.Save,
+                QMessageBox.Apply,
+                QMessageBox.Open,
+                QMessageBox.Retry,
+            ):
+                button = dialog.button(standard_button)
+                if button is not None and button.isEnabled():
+                    button.click()
+                    return True
+
+            # 自定义按钮（例如“保存 / 放弃修改 / 取消”）优先选择接受角色。
+            for button in dialog.buttons():
+                if not button.isEnabled():
+                    continue
+                if dialog.buttonRole(button) in (
+                    QMessageBox.AcceptRole,
+                    QMessageBox.YesRole,
+                    QMessageBox.ApplyRole,
+                ):
+                    button.click()
+                    return True
+            return False
+
+        if isinstance(dialog, QDialog):
+            for button_box in dialog.findChildren(QDialogButtonBox):
+                for standard_button in (
+                    QDialogButtonBox.Ok,
+                    QDialogButtonBox.Yes,
+                    QDialogButtonBox.Save,
+                    QDialogButtonBox.Apply,
+                    QDialogButtonBox.Open,
+                ):
+                    button = button_box.button(standard_button)
+                    if button is not None and button.isEnabled():
+                        button.click()
+                        return True
+        return False
+
     def eventFilter(self, watched, event) -> bool:
-        """处理主工作区快捷键，同时保留文本输入和按钮控件的原生键盘行为。"""
-        if event.type() != QEvent.KeyPress or event.isAutoRepeat() or not self.isActiveWindow():
+        """统一处理快捷键，并保护文本输入和弹窗中的原生编辑操作。"""
+        if event.type() != QEvent.KeyPress or event.isAutoRepeat():
             return super().eventFilter(watched, event)
 
-        # 空格切换视频/摄像头播放状态；焦点位于输入控件或按钮时不拦截。
+        key = event.key()
+        modifiers = event.modifiers()
+        plain_key = modifiers == Qt.NoModifier
+        control_key = modifiers == Qt.ControlModifier
         focus_widget = QApplication.focusWidget()
+        text_entry_widgets = (QLineEdit, QTextEdit, QPlainTextEdit)
+
+        # F 在模态窗口中触发肯定/确认按钮；输入框内仍可正常输入字母 F。
+        modal_widget = QApplication.activeModalWidget()
+        if modal_widget is not None:
+            if plain_key and isinstance(modal_widget, LabelChooserDialog):
+                if Qt.Key_1 <= key <= Qt.Key_9:
+                    row = key - Qt.Key_1
+                    if row < len(modal_widget._classes):
+                        modal_widget.list_widget.setCurrentRow(row)
+                        modal_widget.accept()
+                        return True
+            if plain_key and key == Qt.Key_F:
+                if not isinstance(focus_widget, text_entry_widgets):
+                    if not (
+                        isinstance(focus_widget, QComboBox)
+                        and focus_widget.isEditable()
+                    ) and self._activate_dialog_confirmation(modal_widget):
+                        return True
+            return super().eventFilter(watched, event)
+
+        if not self.isActiveWindow():
+            return super().eventFilter(watched, event)
+
+        # 文本输入、数值编辑、下拉选择和按钮保留自身快捷键，不触发主窗口操作。
         protected_widgets = (
             QLineEdit,
             QAbstractSpinBox,
@@ -4213,13 +4313,63 @@ class AnnotatorWindow(QMainWindow):
             QPushButton,
             QToolButton,
         )
-        if isinstance(focus_widget, protected_widgets) or QApplication.activeModalWidget() is not None:
+        if isinstance(focus_widget, protected_widgets):
             return super().eventFilter(watched, event)
 
-        if event.key() == Qt.Key_Backspace:
+        if control_key:
+            if key == Qt.Key_S:
+                if self.save_action.isEnabled():
+                    self._save()
+                    return True
+            elif key == Qt.Key_D:
+                if self.delete_file_action.isEnabled():
+                    self._delete_current_image_file()
+                    return True
+            elif key == Qt.Key_R:
+                if self.clear_current_action.isEnabled():
+                    self._clear_current_frame_annotations()
+                    return True
+            return super().eventFilter(watched, event)
+
+        if not plain_key:
+            return super().eventFilter(watched, event)
+
+        if key == Qt.Key_A:
+            if self.prev_frame_action.isEnabled():
+                self._step_frame(-1)
+                return True
+        elif key == Qt.Key_D:
+            if self.next_frame_action.isEnabled():
+                self._step_frame(1)
+                return True
+        elif key == Qt.Key_Space:
+            if self.playback_action.isEnabled():
+                self._toggle_playback()
+                return True
+        elif key == Qt.Key_W:
+            self._step_file(-1)
+            return True
+        elif key == Qt.Key_S:
+            self._step_file(1)
+            return True
+        elif key in (Qt.Key_R, Qt.Key_Backspace):
             if self.delete_action.isEnabled():
                 self._delete_selected_box()
                 return True
+        elif key == Qt.Key_F:
+            # 主工作区没有待确认对话框时不占用 F。
+            return super().eventFilter(watched, event)
+        elif key == Qt.Key_C:
+            if self.open_camera_action.isEnabled():
+                self._open_camera()
+                return True
+        elif key == Qt.Key_T:
+            if self.validation_mode_action.isEnabled():
+                self.validation_mode_action.setChecked(
+                    not self.validation_mode_action.isChecked()
+                )
+                return True
+
         return super().eventFilter(watched, event)
 
     def _delete_selected_box(self) -> None:
@@ -4993,7 +5143,8 @@ class AnnotatorWindow(QMainWindow):
         if self._batch_final_status_text:
             self.status_lbl.setText(self._batch_final_status_text)
         if self._close_after_batch:
-            self._close_after_batch = False            QTimer.singleShot(0, self.close)
+            self._close_after_batch = False
+            QTimer.singleShot(0, self.close)
 
     def _stop_batch_ai_predict(self) -> None:
         self._stop_playback()
