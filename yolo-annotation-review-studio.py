@@ -18,7 +18,7 @@ from typing import Optional
 import cv2
 import numpy as np
 from PyQt5.QtCore import QEvent, QPoint, QRectF, Qt, QThread, QSettings, QTimer, pyqtSignal
-from PyQt5.QtGui import QColor, QFont, QImage, QPainter, QPen
+from PyQt5.QtGui import QColor, QFont, QImage, QIntValidator, QPainter, QPen
 from PyQt5.QtWidgets import (
     QAction,
     QApplication,
@@ -843,13 +843,14 @@ class PredictThread(QThread):
 
 
 class CameraCaptureThread(QThread):
-    """独占摄像头设备并持续采集；只保留最新帧，避免 Qt 信号队列积压。"""
+    """读取本机摄像头或 RTSP 视频流；只保留最新帧，避免 Qt 信号队列积压。"""
 
     error_signal = pyqtSignal(str)
 
-    def __init__(self, device_index: int = 0):
+    def __init__(self, source=0):
         super().__init__()
-        self.device_index = int(device_index)
+        self.is_rtsp = isinstance(source, str)
+        self.source = str(source).strip() if self.is_rtsp else int(source)
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
         self._frame_event = threading.Event()
@@ -857,19 +858,33 @@ class CameraCaptureThread(QThread):
         self._sequence = 0
 
     def run(self) -> None:
-        capture = cv2.VideoCapture(self.device_index)
+        if self.is_rtsp:
+            # RTSP 使用 OpenCV 的 FFmpeg 后端解码；MediaMTX 已完成协议转发，无需重新编码。
+            capture = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG)
+        else:
+            capture = cv2.VideoCapture(self.source)
         if not capture.isOpened():
             capture.release()
-            self.error_signal.emit(
-                f"无法打开本机摄像头设备 {self.device_index}。请检查设备连接、权限或占用情况。"
-            )
+            if self.is_rtsp:
+                message = (
+                    "无法打开 RTSP 视频流。请检查 MediaMTX 服务、RTSP 地址及 OpenCV 的 FFmpeg 支持。"
+                )
+            else:
+                message = (
+                    f"无法打开本机摄像头设备 {self.source}。请检查设备连接、权限或占用情况。"
+                )
+            self.error_signal.emit(message)
             return
         try:
             while not self._stop_event.is_set():
                 ok, frame = capture.read()
                 if not ok or frame is None:
                     if not self._stop_event.is_set():
-                        self.error_signal.emit("摄像头读取失败或设备已断开。")
+                        message = (
+                            "RTSP 视频流读取失败。" if self.is_rtsp
+                            else "摄像头读取失败或设备已断开。"
+                        )
+                        self.error_signal.emit(message)
                     break
                 with self._lock:
                     self._latest_frame = frame
@@ -1540,7 +1555,8 @@ class ModelSettingsDialog(QDialog):
         min_box_side: int,
         manual_replace_overlap_enabled: bool,
         manual_replace_overlap_iou: float,
-        camera_device_index: int,
+        camera_source_mode: str,
+        camera_source_value: str,
         secondary_model_path: str,
         validation_model_mode: str,
         validation_overlap_iou: float,
@@ -1551,15 +1567,26 @@ class ModelSettingsDialog(QDialog):
         self.setModal(True)
         self.setMinimumWidth(520)
 
-        self.camera_device_combo = QComboBox()
-        for device_index in range(10):
-            label = f"摄像头 {device_index}（默认）" if device_index == 0 else f"摄像头 {device_index}"
-            self.camera_device_combo.addItem(label, device_index)
-        selected_camera_row = self.camera_device_combo.findData(int(camera_device_index))
-        self.camera_device_combo.setCurrentIndex(max(0, selected_camera_row))
-        self.camera_device_combo.setToolTip("选择摄像头设备。")
+        self.camera_source_mode_combo = QComboBox()
+        self.camera_source_mode_combo.addItem("摄像头", "camera")
+        self.camera_source_mode_combo.addItem("RTSP", "rtsp")
+        selected_source_row = self.camera_source_mode_combo.findData(str(camera_source_mode))
+        self.camera_source_mode_combo.setCurrentIndex(max(0, selected_source_row))
+        self.camera_source_mode_combo.setToolTip("选择本机摄像头或 RTSP 视频流。")
+
+        self.camera_source_value_edit = QLineEdit(str(camera_source_value or ""))
+        self.camera_source_value_edit.setClearButtonEnabled(True)
+        self.camera_source_value_edit.setMaxLength(2048)
+        self.camera_source_value_label = QLabel()
+        self.camera_index_validator = QIntValidator(0, 2147483647, self)
+        self.camera_source_mode_combo.currentIndexChanged.connect(
+            self._update_camera_source_controls
+        )
+        self._update_camera_source_controls()
+
         camera_form = QFormLayout()
-        camera_form.addRow("摄像头设备", self.camera_device_combo)
+        camera_form.addRow("来源类型", self.camera_source_mode_combo)
+        camera_form.addRow(self.camera_source_value_label, self.camera_source_value_edit)
         self.camera_group = QGroupBox("摄像头")
         self.camera_group.setLayout(camera_form)
 
@@ -1716,6 +1743,22 @@ class ModelSettingsDialog(QDialog):
         layout.addWidget(scroll_area, 1)
         layout.addWidget(buttons)
 
+    def _update_camera_source_controls(self, *_args) -> None:
+        is_rtsp = self.camera_source_mode_combo.currentData() == "rtsp"
+        if is_rtsp:
+            self.camera_source_value_label.setText("RTSP 地址")
+            self.camera_source_value_edit.setPlaceholderText(
+                "rtsp://127.0.0.1:8554/dji/main"
+            )
+            self.camera_source_value_edit.setValidator(None)
+        else:
+            self.camera_source_value_label.setText("设备序号")
+            self.camera_source_value_edit.setPlaceholderText("例如：0")
+            self.camera_source_value_edit.setValidator(self.camera_index_validator)
+        self.camera_source_value_edit.setToolTip(
+            "填写 RTSP 视频流地址。" if is_rtsp else "填写本机摄像头设备序号。"
+        )
+
     def _browse_secondary_model(self) -> None:
         current_path = self.secondary_model_edit.text().strip()
         start_dir = str(Path(current_path).expanduser().parent) if current_path else str(SCRIPT_DIR)
@@ -1742,6 +1785,26 @@ class ModelSettingsDialog(QDialog):
         self.show_validation_imgsz_check.setEnabled(bool(multiscale_enabled))
 
     def accept(self) -> None:
+        source_mode = str(self.camera_source_mode_combo.currentData())
+        source_value = self.camera_source_value_edit.text().strip()
+        if source_mode == "camera":
+            try:
+                device_index = int(source_value)
+                if device_index < 0:
+                    raise ValueError
+            except ValueError:
+                QMessageBox.warning(self, "摄像头序号无效", "请输入非负整数形式的摄像头序号。")
+                self.camera_source_value_edit.setFocus()
+                return
+        elif source_mode == "rtsp":
+            if not source_value.lower().startswith(("rtsp://", "rtsps://")):
+                QMessageBox.warning(self, "RTSP 地址无效", "请输入有效的 RTSP 地址。")
+                self.camera_source_value_edit.setFocus()
+                return
+        else:
+            QMessageBox.warning(self, "视频来源无效", "请选择摄像头或 RTSP。")
+            return
+
         if self.multiscale_check.isChecked():
             try:
                 parse_multiscale_sizes(self.multiscale_sizes_edit.text())
@@ -1765,7 +1828,8 @@ class ModelSettingsDialog(QDialog):
             enabled,
             sizes_text,
             self.show_validation_imgsz_check.isChecked(),
-            int(self.camera_device_combo.currentData()),
+            str(self.camera_source_mode_combo.currentData()),
+            self.camera_source_value_edit.text().strip(),
             self.secondary_model_edit.text().strip(),
             str(self.validation_model_mode_combo.currentData()),
             self.validation_overlap_iou_spin.value(),
@@ -2051,7 +2115,8 @@ class AnnotatorWindow(QMainWindow):
         self.dirty_annotation_indices: set[int] = set()
         self.cap: Optional[cv2.VideoCapture] = None
         self.is_camera = False
-        self.camera_device_index = 0
+        self.camera_source_mode = "camera"
+        self.camera_source_value = "0"
         self.camera_thread: Optional[CameraCaptureThread] = None
         self._camera_thread_pending_delete: Optional[CameraCaptureThread] = None
         self.camera_last_sequence = -1
@@ -2108,7 +2173,18 @@ class AnnotatorWindow(QMainWindow):
 
         # 使用 QSettings 持久化推理参数及上次加载的模型路径。
         self.app_settings = QSettings("YOLOAnnotator", "YOLOAnnotator")
-        self.camera_device_index = self._read_int_setting("camera/device_index", 0, 0, 9)
+        self.camera_source_mode = str(self.app_settings.value("camera/source_mode", "camera"))
+        if self.camera_source_mode not in {"camera", "rtsp"}:
+            self.camera_source_mode = "camera"
+        legacy_device_index = self._read_int_setting(
+            "camera/device_index", 0, 0, 2147483647
+        )
+        if self.app_settings.contains("camera/source_value"):
+            self.camera_source_value = str(
+                self.app_settings.value("camera/source_value", "0")
+            ).strip()
+        else:
+            self.camera_source_value = str(legacy_device_index)
         saved_secondary_path = str(self.app_settings.value("validation/secondary_model_path", "")).strip()
         self.secondary_model_path: Optional[Path] = (
             Path(saved_secondary_path).expanduser() if saved_secondary_path else None
@@ -2408,7 +2484,8 @@ class AnnotatorWindow(QMainWindow):
             self.inference_min_box_side,
             self.manual_replace_overlap_enabled,
             self.manual_replace_overlap_iou,
-            self.camera_device_index,
+            self.camera_source_mode,
+            self.camera_source_value,
             str(self.secondary_model_path or ""),
             self.validation_model_mode,
             self.validation_overlap_iou,
@@ -2429,7 +2506,8 @@ class AnnotatorWindow(QMainWindow):
                 new_multiscale_enabled,
                 new_multiscale_sizes,
                 new_show_validation_imgsz,
-                new_camera_device_index,
+                new_camera_source_mode,
+                new_camera_source_value,
                 secondary_model_path_text,
                 new_validation_model_mode,
                 new_validation_overlap_iou,
@@ -2468,7 +2546,10 @@ class AnnotatorWindow(QMainWindow):
                     return
 
         camera_was_open = self.is_camera
-        old_camera_device_index = self.camera_device_index
+        old_camera_source = (
+            self.camera_source_mode,
+            self.camera_source_value,
+        )
         (
             self.inference_conf,
             self.inference_iou,
@@ -2515,9 +2596,19 @@ class AnnotatorWindow(QMainWindow):
         self.app_settings.setValue(
             "inference/show_validation_imgsz", self.show_validation_imgsz
         )
-        camera_device_changed = new_camera_device_index != self.camera_device_index
-        self.camera_device_index = new_camera_device_index
-        self.app_settings.setValue("camera/device_index", self.camera_device_index)
+        camera_source_changed = (
+            new_camera_source_mode,
+            new_camera_source_value,
+        ) != old_camera_source
+        self.camera_source_mode = new_camera_source_mode
+        self.camera_source_value = new_camera_source_value
+        self.app_settings.setValue("camera/source_mode", self.camera_source_mode)
+        self.app_settings.setValue("camera/source_value", self.camera_source_value)
+        if self.camera_source_mode == "camera":
+            # 保留旧设置键，便于旧版本回退时沿用设备编号。
+            self.app_settings.setValue(
+                "camera/device_index", int(self.camera_source_value)
+            )
         self.app_settings.setValue(
             "validation/secondary_model_path",
             str(self.secondary_model_path) if self.secondary_model_path is not None else "",
@@ -2526,10 +2617,18 @@ class AnnotatorWindow(QMainWindow):
         self.app_settings.setValue("validation/dual_model_overlap_iou", self.validation_overlap_iou)
         self.app_settings.sync()
         self.open_camera_action.setToolTip("打开摄像头。")
-        if camera_device_changed and camera_was_open:
-            # 设置应用后立即重启采集线程，切换到新设备；保持当前实时验证开关状态。
+        if camera_source_changed and camera_was_open:
+            # 设置应用后立即切换输入源；保持当前实时验证开关状态。
+            old_source_text = (
+                f"摄像头 {old_camera_source[1]}"
+                if old_camera_source[0] == "camera" else old_camera_source[1]
+            )
+            new_source_text = (
+                f"摄像头 {self.camera_source_value}"
+                if self.camera_source_mode == "camera" else self.camera_source_value
+            )
             self.status_lbl.setText(
-                f"正在切换摄像头设备：{old_camera_device_index} → {self.camera_device_index}……"
+                f"正在切换视频来源：{old_source_text} → {new_source_text}……"
             )
             self._open_camera()
         else:
@@ -2541,12 +2640,12 @@ class AnnotatorWindow(QMainWindow):
                 f"新框重叠清理={self.manual_replace_overlap_enabled} "
                 f"(IoU={self.manual_replace_overlap_iou:.2f}), "
                 f"多分辨率推理={self.multiscale_enabled} ({self.multiscale_sizes}), "
-                f"摄像头设备={self.camera_device_index}"
+                f"视频来源={'摄像头 ' + self.camera_source_value if self.camera_source_mode == 'camera' else self.camera_source_value}"
             )
         if self.validation_mode:
             # 应用参数后使旧配置的在途结果失效；线程结束后会自动补做最新请求。
             self.validation_generation += 1
-            if self.frame is not None and not (camera_device_changed and camera_was_open):
+            if self.frame is not None and not (camera_source_changed and camera_was_open):
                 self._run_validation()
 
     # ---------- 模型 ----------
@@ -3436,7 +3535,7 @@ class AnnotatorWindow(QMainWindow):
         return True
 
     def _open_camera(self) -> None:
-        """打开设置中选定的本机摄像头；无需预先打开数据集目录。"""
+        """打开设置中选定的本机摄像头或 RTSP 视频流；无需预先打开数据集目录。"""
         if not self._confirm_unsaved_changes():
             return
         if self.predicting or (self.batch_thread is not None and self.batch_thread.isRunning()):
@@ -3475,14 +3574,24 @@ class AnnotatorWindow(QMainWindow):
         self.file_index = -1
         self._set_file_list_current()
 
-        thread = CameraCaptureThread(self.camera_device_index)
+        capture_source = (
+            self.camera_source_value
+            if self.camera_source_mode == "rtsp"
+            else int(self.camera_source_value)
+        )
+        thread = CameraCaptureThread(capture_source)
         thread.setParent(self)
         self.camera_thread = thread
         thread.error_signal.connect(self._on_camera_error)
         thread.finished.connect(self._on_camera_thread_finished)
         thread.start()
         self.camera_timer.start()
-        self.status_lbl.setText(f"正在连接本机摄像头（设备 {self.camera_device_index}）……")
+        if self.camera_source_mode == "rtsp":
+            self.status_lbl.setText(f"正在连接 RTSP 视频流：{self.camera_source_value}……")
+        else:
+            self.status_lbl.setText(
+                f"正在连接本机摄像头（设备 {self.camera_source_value}）……"
+            )
         self._sync_ui_state()
 
     def _on_camera_error(self, message: str) -> None:
@@ -4430,7 +4539,7 @@ class AnnotatorWindow(QMainWindow):
 
     def _validation_source_key(self) -> Optional[str]:
         if self.is_camera:
-            return f"camera:{self.camera_device_index}"
+            return f"camera:{self.camera_source_mode}:{self.camera_source_value}"
         return str(self.current_file) if self.current_file is not None else None
 
     def _validation_request_signature(
